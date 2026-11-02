@@ -1,0 +1,8 @@
+node_modules/
+lib/
+preview/dist/
+*.tgz
+.DS_Store
+.npm-cache/
+.scratch/
+.venv/
