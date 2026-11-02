@@ -44,12 +44,13 @@ const STREAM_SOURCE = new URL('../assets/computer-stream.swift', import.meta.url
 const STREAM_EXIT = /** @type {Record<number, string>} */ ({ 3: 'window-gone', 4: 'capture-failed', 5: 'capture-stopped' })
 /** 冻结帧多久清一次过期的 */
 const EVICT_EVERY_MS = 60_000
-/** 发了 SIGTERM 多久还没退就 SIGKILL */
-const KILL_GRACE_MS = 2000
+/** 发了 SIGTERM 多久还没退就 SIGKILL。辅助程序收到 SIGTERM 会先等系统把流停掉再退（自己最多等 4 秒），这里要比它长 */
+const KILL_GRACE_MS = 6000
 
 /**
- * 停掉一个辅助程序：先关 stdin（它读到 EOF 自己退），再 SIGTERM，2 秒还在就 SIGKILL。
- * 屏幕录制不能因为一次 kill 没生效就一直开着
+ * 停掉一个辅助程序：先关 stdin、再 SIGTERM，两条路它都会先 stopCapture 再退出；6 秒还在就 SIGKILL。
+ * 不能一上来就硬杀：开流请求还在系统 replayd 里时进程死了，replayd 会照样把流建起来、没人停，
+ * 窗口标题栏的紫色录屏标一直亮着、那个应用也退不掉（2026-11-02 真机：Kiro Manager Lite）
  * @param {import('node:child_process').ChildProcess} proc
  */
 function killHelper(proc) {
@@ -355,7 +356,9 @@ export function apply(ctx) {
   })
 
   /**
-   * 补拍一帧：起一次辅助程序，拿到第一帧就停。同一对话同时只拍一次；正在取流时不拍（流本身就在更新画面）。
+   * 补拍一帧：起一次辅助程序的单张截图模式（snap，系统里不建流），拿到那一帧就结束。同一对话同时只拍一次；正在取流时不拍（流本身就在更新画面）。
+   * 原来是开 2fps 的流、拿到第一帧就杀：开流还没完成时进程死了，replayd 会留下一条没人停的流，
+   * 被拍的应用标题栏一直挂着紫色录屏标、退不掉（2026-11-02 真机：Kiro Manager Lite）。
    * 只拍当前目标窗口，拍的期间换了窗口就丢掉。截图只在内存里，和流的帧一样。
    * @param {string} id
    * @param {Entry} entry
@@ -367,7 +370,7 @@ export function apply(ctx) {
       const binary = await helper()
       if (binary === undefined || disposed || entries.get(id) !== entry || !sameWindow(entry.target, target) || entry.stream !== undefined) return
       await new Promise((done) => {
-        const proc = spawn(binary, ['window', String(target.windowId), String(target.pid), '2', String(FRAME_EDGE)], { stdio: ['pipe', 'pipe', 'ignore'] })
+        const proc = spawn(binary, ['snap', String(target.windowId), String(target.pid), String(FRAME_EDGE)], { stdio: ['pipe', 'pipe', 'ignore'] })
         snapshotProcs.add(proc)
         const finish = () => {
           clearTimeout(timer)

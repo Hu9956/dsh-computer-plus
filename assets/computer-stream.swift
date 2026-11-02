@@ -1,7 +1,8 @@
-// 电脑操控画面取流（dsh-harness-plus 的 macOS 辅助程序，插件首次用到时在本机用 swiftc 编译）。
+// 电脑操控画面取流（dsh-computer-plus 的 macOS 辅助程序，插件首次用到时在本机用 swiftc 编译）。
 //
 // 用法：
-//   computer-stream window <windowId> <pid> [fps] [edge]
+//   computer-stream window <windowId> <pid> [fps] [edge]   持续取流
+//   computer-stream snap <windowId> <pid> [edge]           只拍一张（单张截图，不开流），写一帧后退出
 //   computer-stream display [fps] [edge]
 //   computer-stream icon <pid>        把这个进程所属应用的图标画成 64×64 PNG 写到 stdout，然后退出
 //
@@ -9,8 +10,13 @@
 // 每帧编码成 JPEG（质量 0.7）写到 stdout：4 字节大端长度 + JPEG 数据。和上一帧字节完全相同就不写
 // （实测静止的窗口系统也每帧都报「画面变了」，不能靠它判断）。编码还没完时来的帧直接丢，不排队。
 //
-// 退出码：0 stdin 关闭（父进程没了）；3 窗口不存在或已关闭；4 取不到画面（多半是没有屏幕录制权限）；5 取流中途出错；2 参数错。
+// 退出码：0 正常结束（stdin 关闭、收到 SIGTERM、拍完一张）；3 窗口不存在或已关闭；4 取不到画面（多半是没有屏幕录制权限）；
+// 5 取流中途出错；2 参数错。
 // 窗口身份用 windowId + pid 双重校验：窗口关掉后 id 可能被别的应用复用，只认 id 会截到不该看的窗口。
+//
+// 停止一定先 stopCapture 再退出（2026-11-02 真机）：开流请求还在系统 replayd 里排着时进程就死了，
+// replayd 会在进程死后照样把流建起来，这条流没人收、也没人停，窗口标题栏的紫色录屏标一直亮着，
+// 直到 replayd 重启。所以 SIGTERM 和 stdin 关闭都走同一个收尾：开流中就等它开完再停，已经在流就先停再退。
 
 import AppKit
 import CoreImage
@@ -46,18 +52,26 @@ if argv.count == 3, argv[1] == "icon", let pid = Int32(argv[2]) {
 }
 
 var target: Target
-var rest: ArraySlice<String>
+var single = false
+var fps: Int32 = 10
+var edge: Double = 640
 if argv.count >= 4, argv[1] == "window", let wid = UInt32(argv[2]), let pid = Int32(argv[3]) {
   target = .window(wid, pid)
-  rest = argv.dropFirst(4)
+  let rest = argv.dropFirst(4)
+  fps = Int32(rest.first ?? "") ?? 10
+  edge = Double(rest.dropFirst().first ?? "") ?? 640
+} else if argv.count >= 4, argv[1] == "snap", let wid = UInt32(argv[2]), let pid = Int32(argv[3]) {
+  target = .window(wid, pid)
+  single = true
+  edge = Double(argv.dropFirst(4).first ?? "") ?? 640
 } else if argv.count >= 2, argv[1] == "display" {
   target = .display
-  rest = argv.dropFirst(2)
+  let rest = argv.dropFirst(2)
+  fps = Int32(rest.first ?? "") ?? 10
+  edge = Double(rest.dropFirst().first ?? "") ?? 640
 } else {
-  fail(2, "usage: computer-stream window <windowId> <pid> [fps] [edge] | display [fps] [edge]")
+  fail(2, "usage: computer-stream window <windowId> <pid> [fps] [edge] | snap <windowId> <pid> [edge] | display [fps] [edge]")
 }
-let fps = Int32(rest.first ?? "") ?? 10
-let edge = Double(rest.dropFirst().first ?? "") ?? 640
 
 /// 按长边 edge 等比缩放（size 是点；小窗口最多放到 2 倍，即 Retina 原生像素），宽高取偶数
 func fit(_ size: CGSize) -> (Int, Int) {
@@ -67,10 +81,24 @@ func fit(_ size: CGSize) -> (Int, Int) {
   return (w, h)
 }
 
+let ciContext = CIContext()
+let output = FileHandle.standardOutput
+
+func jpeg(_ cg: CGImage) -> Data? {
+  let data = NSMutableData()
+  guard let dest = CGImageDestinationCreateWithData(data, UTType.jpeg.identifier as CFString, 1, nil) else { return nil }
+  CGImageDestinationAddImage(dest, cg, [kCGImageDestinationLossyCompressionQuality: 0.7] as CFDictionary)
+  guard CGImageDestinationFinalize(dest) else { return nil }
+  return data as Data
+}
+
+func writeFrame(_ frame: Data) {
+  var length = UInt32(frame.count).bigEndian
+  output.write(Data(bytes: &length, count: 4) + frame)
+}
+
 final class Sink: NSObject, SCStreamOutput, SCStreamDelegate {
-  private let context = CIContext()
   private let encoder = DispatchQueue(label: "computer-stream.encode")
-  private let out = FileHandle.standardOutput
   private var busy = false
   private var last = Data()
 
@@ -85,16 +113,10 @@ final class Sink: NSObject, SCStreamOutput, SCStreamDelegate {
     let image = CIImage(cvPixelBuffer: pixels)
     encoder.async {
       defer { self.busy = false }
-      guard let cg = self.context.createCGImage(image, from: image.extent) else { return }
-      let data = NSMutableData()
-      guard let dest = CGImageDestinationCreateWithData(data, UTType.jpeg.identifier as CFString, 1, nil) else { return }
-      CGImageDestinationAddImage(dest, cg, [kCGImageDestinationLossyCompressionQuality: 0.7] as CFDictionary)
-      guard CGImageDestinationFinalize(dest) else { return }
-      let jpeg = data as Data
-      if jpeg == self.last { return }
-      self.last = jpeg
-      var length = UInt32(jpeg.count).bigEndian
-      self.out.write(Data(bytes: &length, count: 4) + jpeg)
+      guard let cg = ciContext.createCGImage(image, from: image.extent), let frame = jpeg(cg) else { return }
+      if frame == self.last { return }
+      self.last = frame
+      writeFrame(frame)
     }
   }
 
@@ -102,6 +124,64 @@ final class Sink: NSObject, SCStreamOutput, SCStreamDelegate {
     fail(5, "stream stopped: \(error.localizedDescription)")
   }
 }
+
+/// 收尾：保证系统里的流先停掉，进程再退出
+final class Lifecycle {
+  private let lock = NSLock()
+  private var stream: SCStream?
+  private var starting = false
+  private var stopping = false
+
+  /// 要开流了。已经在收尾就不开（返回 false），请求根本不发给系统
+  func willStart(_ s: SCStream) -> Bool {
+    lock.lock(); defer { lock.unlock() }
+    if stopping { return false }
+    stream = s
+    starting = true
+    return true
+  }
+
+  /// 开流返回了（成功或失败）。这期间要求过收尾：返回 true，调用方停流后退出
+  func didStart() -> Bool {
+    lock.lock(); defer { lock.unlock() }
+    starting = false
+    return stopping
+  }
+
+  /// SIGTERM、stdin 关闭都走这里
+  func shutdown() {
+    lock.lock()
+    if stopping { lock.unlock(); return }
+    stopping = true
+    let running = stream
+    let pending = starting
+    lock.unlock()
+    // 兜底：系统一直不回也不能永远不退（父进程 6 秒后会 SIGKILL）
+    DispatchQueue.global().asyncAfter(deadline: .now() + 4) { exit(0) }
+    // 开流中：等 didStart 看到 stopping 再停（这时退出，replayd 会在我们死后把流建起来，没人停）
+    if pending { return }
+    guard let running else { exit(0) }
+    Task {
+      try? await running.stopCapture()
+      exit(0)
+    }
+  }
+}
+
+let lifecycle = Lifecycle()
+
+// 父进程没了（stdin 关闭）就收尾退出，不留孤儿进程
+FileHandle.standardInput.readabilityHandler = { handle in
+  if handle.availableData.isEmpty {
+    handle.readabilityHandler = nil
+    lifecycle.shutdown()
+  }
+}
+// SIGTERM 也先停流再退（默认处理是直接死，正好撞上开流就会留下没人管的流）
+signal(SIGTERM, SIG_IGN)
+let termSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+termSource.setEventHandler { lifecycle.shutdown() }
+termSource.resume()
 
 /// 找目标：窗口要 id 和 pid 都对上
 func resolve(_ content: SCShareableContent) -> (SCContentFilter, CGSize)? {
@@ -114,11 +194,6 @@ func resolve(_ content: SCShareableContent) -> (SCContentFilter, CGSize)? {
     guard let display = content.displays.first(where: { $0.displayID == main }) ?? content.displays.first else { return nil }
     return (SCContentFilter(display: display, excludingWindows: []), CGSize(width: display.width, height: display.height))
   }
-}
-
-// 父进程没了（stdin 关闭）就退出，不留孤儿进程
-FileHandle.standardInput.readabilityHandler = { handle in
-  if handle.availableData.isEmpty { exit(0) }
 }
 
 let sink = Sink()
@@ -134,22 +209,51 @@ Task {
   var current = fit(size)
   config.width = current.0
   config.height = current.1
-  config.minimumFrameInterval = CMTime(value: 1, timescale: max(1, fps))
   config.showsCursor = false
+
+  // 只拍一张：单张截图 API，系统里不建流，进程什么时候退都不会留下没人管的流
+  if single {
+    let image: CGImage
+    do {
+      image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
+    } catch {
+      fail(4, "capture failed: \(error.localizedDescription)")
+    }
+    guard let frame = jpeg(image) else { fail(5, "encode failed") }
+    writeFrame(frame)
+    exit(0)
+  }
+
+  config.minimumFrameInterval = CMTime(value: 1, timescale: max(1, fps))
   config.queueDepth = 3
   config.pixelFormat = kCVPixelFormatType_32BGRA
   let stream = SCStream(filter: filter, configuration: config, delegate: sink)
   do {
     try stream.addStreamOutput(sink, type: .screen, sampleHandlerQueue: DispatchQueue(label: "computer-stream.capture"))
-    try await stream.startCapture()
   } catch {
     fail(4, "start capture failed: \(error.localizedDescription)")
   }
-  // 每秒看一次：窗口关了就退出；大小变了就跟着改输出尺寸（不然画面会被拉伸）
+  guard lifecycle.willStart(stream) else { exit(0) }
+  var started = true
+  do {
+    try await stream.startCapture()
+  } catch {
+    started = false
+    if !lifecycle.didStart() { fail(4, "start capture failed: \(error.localizedDescription)") }
+    exit(0)
+  }
+  if started && lifecycle.didStart() {
+    try? await stream.stopCapture()
+    exit(0)
+  }
+  // 每秒看一次：窗口关了就停流退出；大小变了就跟着改输出尺寸（不然画面会被拉伸）
   while true {
     try? await Task.sleep(nanoseconds: 1_000_000_000)
     guard let latest = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false) else { continue }
-    guard let (_, size) = resolve(latest) else { fail(3, "window gone") }
+    guard let (_, size) = resolve(latest) else {
+      try? await stream.stopCapture()
+      fail(3, "window gone")
+    }
     let next = fit(size)
     if next != current {
       current = next

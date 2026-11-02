@@ -202,3 +202,16 @@ test('启动守护进程不带 DSH 的 ELECTRON_RUN_AS_NODE（否则它打开的
   const env = daemonEnv({ HOME: '/Users/x', PATH: '/usr/bin', ELECTRON_RUN_AS_NODE: '1', NODE_OPTIONS: '--inspect' })
   assert.deepEqual(env, { HOME: '/Users/x', PATH: '/usr/bin' })
 })
+
+test('回合结束补拍用单张截图（snap），不开流；停辅助程序先给它时间停流（2026-11-02 真机：Kiro 标题栏的录屏标一直不灭）', async () => {
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync(new URL('../src/index.js', import.meta.url), 'utf8')
+  assert.match(src, /spawn\(binary, \['snap', String\(target\.windowId\), String\(target\.pid\), String\(FRAME_EDGE\)\]/)
+  assert.doesNotMatch(src, /'window', String\(target\.windowId\), String\(target\.pid\), '2'/, '不再用 2fps 的流补拍')
+  const grace = Number(/const KILL_GRACE_MS = (\d+)/.exec(src)?.[1])
+  assert.ok(grace > 4000, `SIGKILL 要晚于辅助程序自己的 4 秒兜底，现在是 ${grace}`)
+  const swift = readFileSync(new URL('../assets/computer-stream.swift', import.meta.url), 'utf8')
+  assert.match(swift, /SCScreenshotManager\.captureImage/, 'snap 走单张截图 API')
+  assert.match(swift, /DispatchSource\.makeSignalSource\(signal: SIGTERM/, 'SIGTERM 先停流再退')
+  assert.match(swift, /try\? await running\.stopCapture\(\)/)
+})
