@@ -1,6 +1,6 @@
 import { execFile, spawn } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
-import { mkdir, readFile, rename, stat } from 'node:fs/promises'
+import { mkdir, readFile, rename, stat, unlink } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -40,8 +40,26 @@ const MJPEG_MAX_BUFFERED = 1024 * 1024
 const CURSOR_IDLE_MS = 2000
 const CURSOR_POLL_MS = 250
 const STREAM_SOURCE = new URL('../assets/computer-stream.swift', import.meta.url)
-/** 辅助程序退出码 → 面板上的原因 */
-const STREAM_EXIT = /** @type {Record<number, string>} */ ({ 3: 'window-gone', 4: 'capture-failed', 5: 'capture-failed' })
+/** 辅助程序退出码 → 面板上的原因。4 = 取不到画面（多半没有屏幕录制权限）；5 = 取流中途停了（锁屏、在系统的录屏指示里点了停止），不是权限问题 */
+const STREAM_EXIT = /** @type {Record<number, string>} */ ({ 3: 'window-gone', 4: 'capture-failed', 5: 'capture-stopped' })
+/** 冻结帧多久清一次过期的 */
+const EVICT_EVERY_MS = 60_000
+/** 发了 SIGTERM 多久还没退就 SIGKILL */
+const KILL_GRACE_MS = 2000
+
+/**
+ * 停掉一个辅助程序：先关 stdin（它读到 EOF 自己退），再 SIGTERM，2 秒还在就 SIGKILL。
+ * 屏幕录制不能因为一次 kill 没生效就一直开着
+ * @param {import('node:child_process').ChildProcess} proc
+ */
+function killHelper(proc) {
+  proc.stdout?.removeAllListeners('data')
+  proc.removeAllListeners('exit')
+  if (proc.exitCode !== null || proc.signalCode !== null) return
+  proc.stdin?.end()
+  proc.kill('SIGTERM')
+  setTimeout(() => { if (proc.exitCode === null && proc.signalCode === null) proc.kill('SIGKILL') }, KILL_GRACE_MS).unref()
+}
 
 /**
  * 给 Agent 的提示。用户 2026-11-02 定的优先级：先把电脑操控好、花得少，面板画面排第二。
@@ -52,7 +70,7 @@ export const COMPUTER_PROMPT = [
   '## Computer use',
   'To operate a macOS app, use the computer_* tools: computer_launch_app or computer_list_windows to find the pid and window_id, computer_get_window_state to observe, then computer_click / computer_type_text / computer_press_key / computer_scroll. They drive cua-driver in the background and show the window live in the conversation panel.',
   'Keep it cheap: read a window once, send every action you already know in the same step (they run in order), and read it again only to check the result or when the window changed. Every tool result stays in the conversation and is resent on each later step, so avoid extra reads and extra steps.',
-  'Use these tools by default. Writing a cua-driver script in bash is fine when it is clearly cheaper, such as a long fixed sequence or a loop over many items, or for what these tools do not cover (drag, native menus, browser pages). Tell the user that the panel will not show those steps.',
+  'Use these tools by default. Writing a cua-driver script in bash is fine when it is clearly cheaper, such as a long fixed sequence or a loop over many items, or for what these tools do not cover (drag, native menu commands via invoke_menu, browser pages, steps that need the window in front). Tell the user that the panel will not show those steps.',
 ].join('\n')
 
 /**
@@ -104,36 +122,52 @@ export function writeMjpeg(res, bytes) {
  */
 async function buildHelper(logger) {
   if (process.platform !== 'darwin') return undefined
+  /** @type {string | undefined} */
+  let partial
   try {
     const source = await readFile(STREAM_SOURCE)
     const hash = createHash('sha256').update(source).digest('hex').slice(0, 16)
     const dir = join(process.env.HOME ?? tmpdir(), 'Library/Caches/dsh-computer-plus')
     const binary = join(dir, `computer-stream-${hash}`)
     if (await stat(binary).then(info => info.isFile(), () => false)) return binary
+    // 没装命令行工具时 /usr/bin/xcrun 会弹系统的「安装开发者工具」对话框：先用 xcode-select 问一声（不弹窗），没有就不编
+    const tools = await new Promise(done => execFile('/usr/bin/xcode-select', ['-p'], { timeout: 10_000 }, error => done(error === null)))
+    if (!tools) {
+      logger?.warn?.('computer-plus: no Xcode command line tools, live picture unavailable (install with xcode-select --install)')
+      return undefined
+    }
     await mkdir(dir, { recursive: true })
-    const partial = `${binary}.${randomUUID()}.partial`
+    partial = `${binary}.${randomUUID()}.partial`
+    const out = partial
     await new Promise((done, fail) => {
-      execFile('/usr/bin/xcrun', ['swiftc', '-O', fileURLToPath(STREAM_SOURCE), '-o', partial], { timeout: 180_000 }, error => error ? fail(error) : done(undefined))
+      execFile('/usr/bin/xcrun', ['swiftc', '-O', fileURLToPath(STREAM_SOURCE), '-o', out], { timeout: 180_000 }, error => error ? fail(error) : done(undefined))
     })
     await rename(partial, binary)
+    partial = undefined
     logger?.info?.(`computer-plus: built stream helper ${binary}`)
     return binary
   } catch (error) {
     logger?.warn?.(`computer-plus: stream helper unavailable: ${String(error)}`)
     return undefined
+  } finally {
+    if (partial !== undefined) await unlink(partial).catch(() => {})
   }
 }
 
 /**
- * 和官方 /api 用同一套登录校验；没有 connection 服务一律拒绝
+ * 和官方 /api 用同一套登录校验；没有 connection 服务一律拒绝。
+ * 只给本机主人看（和官方 fetch 路由一样认 principal.kind === 'owner'）：以后 DSH 有了别的访问者，也看不到屏幕
  * @param {any} scope
  * @param {any} ctx
  * @param {import('node:http').IncomingMessage} req
+ * @returns {number} 0 = 放行，否则是要回的状态码
  */
-function admitted(scope, ctx, req) {
+function admission(scope, ctx, req) {
   const connection = scope.get?.('connection') ?? ctx.get?.('connection')
-  if (typeof connection?.admit !== 'function') return false
-  return !('rejection' in connection.admit(req))
+  if (typeof connection?.admit !== 'function') return 401
+  const admitted = connection.admit(req)
+  if ('rejection' in admitted) return Number(admitted.rejection) || 401
+  return admitted.peer?.principal?.kind === 'owner' ? 0 : 403
 }
 
 /**
@@ -162,31 +196,61 @@ function sendJson(res, status, data) {
  *   error?: string,
  *   touchedAt: number,
  *   stream?: Stream,
- *   helperFailed?: boolean,
+ *   captureDenied?: boolean,
+ *   blockedAt?: number,
  *   clicks: number,
  *   cursor?: { point?: { x: number, y: number }, askedAt: number, running: boolean, timer?: ReturnType<typeof setTimeout> },
  * }} Entry
  */
+
+/** 编不出辅助程序后多久再试一次（每个请求都重编太慢，永远不重试又会让一次失败一直生效） */
+const HELPER_RETRY_MS = 60_000
 
 /** @param {any} ctx */
 export function apply(ctx) {
   const driver = createDriver({ logger: ctx.logger })
   /** @type {Map<string, Entry>} */
   const entries = new Map()
+  /** 补拍用的辅助程序：卸载时也要停掉 */
+  /** @type {Set<import('node:child_process').ChildProcess>} */
+  const snapshotProcs = new Set()
   let disposed = false
 
   /** @type {Promise<string | undefined> | undefined} */
   let helperPath
+  let helperFailedAt = 0
   let helperBuilding = false
-  const helper = () => (helperPath ??= (async () => {
-    const slow = setTimeout(() => { helperBuilding = true }, 300)
-    try {
-      return await buildHelper(ctx.logger)
-    } finally {
-      clearTimeout(slow)
-      helperBuilding = false
-    }
-  })())
+  const helper = () => {
+    if (helperPath === undefined && Date.now() - helperFailedAt < HELPER_RETRY_MS) return Promise.resolve(undefined)
+    return (helperPath ??= (async () => {
+      const slow = setTimeout(() => { helperBuilding = true }, 300)
+      try {
+        const built = await buildHelper(ctx.logger)
+        if (built === undefined) {
+          helperPath = undefined
+          helperFailedAt = Date.now()
+        }
+        return built
+      } finally {
+        clearTimeout(slow)
+        helperBuilding = false
+      }
+    })())
+  }
+  /** 起不来（缓存里的程序被删了、没有执行权限）：下次重新找、重新编 */
+  const forgetHelper = () => { helperPath = undefined }
+
+  /**
+   * 辅助程序退出码记到这一条上。3（窗口没了）、5（中途停了）：这一步不再起，Agent 下一步再试；
+   * 4（没有屏幕录制权限）：这一轮不再起，免得每次重连都起一个进程、甚至反复弹权限窗口（下一轮再试一次）
+   * @param {Entry} entry
+   * @param {number | null} code
+   */
+  const noteExit = (entry, code) => {
+    if (code === 3 || code === 4 || code === 5) entry.blockedAt = entry.target.at
+    if (code === 4) entry.captureDenied = true
+  }
+  const blocked = (/** @type {Entry} */ entry) => entry.captureDenied === true || entry.blockedAt === entry.target.at
 
   const sameWindow = (/** @type {ComputerTarget} */ a, /** @type {ComputerTarget} */ b) => a.pid === b.pid && a.windowId === b.windowId
 
@@ -206,9 +270,7 @@ export function apply(ctx) {
     if (stream === undefined) return
     entry.stream = undefined
     clearTimeout(stream.linger)
-    stream.proc.stdout?.removeAllListeners('data')
-    stream.proc.removeAllListeners('exit')
-    stream.proc.kill('SIGTERM')
+    killHelper(stream.proc)
     for (const res of stream.viewers.keys()) res.end()
     stream.viewers.clear()
   }
@@ -266,9 +328,13 @@ export function apply(ctx) {
     }
     const now = Date.now()
     const wasActive = current?.target.active === true
+    /** 结束前面板正开着在取流：流已经推了最新的画面，不用再补拍（再拍一次菜单栏的录屏图标会多闪一下） */
+    const wasStreaming = current?.stream !== undefined
     /** 这个对话现在的记录（换窗口时是新建的那条） */
     let entry
     if (current !== undefined && sameWindow(current.target, target)) {
+      // 新的一轮：上一轮没权限的记号清掉，再试一次（用户可能刚在系统设置里打开了权限）
+      if (target.active && !wasActive) current.captureDenied = false
       current.target = target
       current.touchedAt = now
       if (!target.active) stopStream(current)
@@ -284,7 +350,7 @@ export function apply(ctx) {
     // 这一轮结束、而且没人在看：补拍一帧当冻结画面，面板之后打开也有东西可看。
     // 2026-11-02 真机：一轮只有 4 秒，面板没开着，取流从没启动，结束后显示「本轮没有留下画面」。
     // 只在结束时拍一次，不每步都拍：每次拍菜单栏都会闪一下录屏图标；面板开着时取流本来就在更新画面
-    if (!target.active && wasActive) snapshot(id, entry)
+    if (!target.active && wasActive && !(wasStreaming && entry === current && entry.frame !== undefined)) snapshot(id, entry)
     evict(now)
   })
 
@@ -295,18 +361,18 @@ export function apply(ctx) {
    * @param {Entry} entry
    */
   const snapshot = (id, entry) => {
-    if (disposed || entry.capturing !== undefined || entry.helperFailed === true || process.platform !== 'darwin') return
+    if (disposed || entry.capturing !== undefined || entry.captureDenied === true || process.platform !== 'darwin') return
     const target = entry.target
     entry.capturing = (async () => {
       const binary = await helper()
       if (binary === undefined || disposed || entries.get(id) !== entry || !sameWindow(entry.target, target) || entry.stream !== undefined) return
       await new Promise((done) => {
         const proc = spawn(binary, ['window', String(target.windowId), String(target.pid), '2', String(FRAME_EDGE)], { stdio: ['pipe', 'pipe', 'ignore'] })
+        snapshotProcs.add(proc)
         const finish = () => {
           clearTimeout(timer)
-          proc.stdout?.removeAllListeners('data')
-          proc.removeAllListeners('exit')
-          proc.kill('SIGTERM')
+          snapshotProcs.delete(proc)
+          killHelper(proc)
           done(undefined)
         }
         const timer = setTimeout(finish, SNAPSHOT_TIMEOUT_MS)
@@ -318,14 +384,15 @@ export function apply(ctx) {
           },
           finish,
         ))
-        proc.on('error', () => { entry.helperFailed = true; finish() })
+        // 起不来（缓存里的程序没了）：下次重新编，不记成没权限
+        proc.on('error', () => { forgetHelper(); finish() })
         proc.on('exit', (code) => {
           const current = entries.get(id) === entry && sameWindow(entry.target, target)
-          if (code === 3 && current) entry.error = 'window-gone'
-          // 4/5 = 取不到画面（多半没有屏幕录制权限）：面板要能说明原因，取流也别再试
-          if (code === 4 || code === 5) {
-            entry.helperFailed = true
-            if (current && entry.frame === undefined) entry.error = 'capture-failed'
+          if (current) {
+            noteExit(entry, code)
+            const reason = STREAM_EXIT[code ?? -1]
+            // 已经有一帧就留着它当冻结画面；没有才说明原因
+            if (reason !== undefined && (code === 3 || entry.frame === undefined)) entry.error = reason
           }
           finish()
         })
@@ -347,14 +414,14 @@ export function apply(ctx) {
     const mine = () => entry.stream === stream && stream.proc === proc
     proc.stdout?.on('data', frameReader(
       bytes => { if (mine()) publish(entry, bytes) },
-      () => { if (mine()) { entry.error = 'capture-failed'; stopStream(entry) } },
+      () => { if (mine()) { entry.error = 'capture-failed'; entry.blockedAt = entry.target.at; stopStream(entry) } },
     ))
-    proc.on('error', () => { if (mine()) { entry.error = 'capture-failed'; entry.helperFailed = true; stopStream(entry) } })
+    proc.on('error', () => { if (mine()) { forgetHelper(); entry.error = 'capture-failed'; entry.blockedAt = entry.target.at; stopStream(entry) } })
     proc.on('exit', (code) => {
       if (!mine()) return
       entry.error = STREAM_EXIT[code ?? -1] ?? 'capture-failed'
-      // 取不到画面（多半没有屏幕录制权限）：这个窗口不再起辅助程序，免得客户端每 2 秒重连就起一个新进程
-      if (code === 4 || code === 5) entry.helperFailed = true
+      // 窗口没了、中途停了、没权限：这一步不再起辅助程序，免得客户端每 2 秒重连就起一个新进程（2026-11-02 审查）
+      noteExit(entry, code)
       stopStream(entry)
     })
   }
@@ -367,10 +434,7 @@ export function apply(ctx) {
     if (want === stream.edge) return
     const binary = await helper()
     if (binary === undefined || entry.stream !== stream) return
-    const old = stream.proc
-    old.stdout?.removeAllListeners('data')
-    old.removeAllListeners('exit')
-    old.kill('SIGTERM')
+    killHelper(stream.proc)
     spawnHelper(entry, stream, binary, want)
   }
 
@@ -382,14 +446,15 @@ export function apply(ctx) {
    */
   const startStream = async (id, entry, edge) => {
     if (entry.stream !== undefined) return true
-    if (entry.helperFailed === true) return false
+    if (blocked(entry)) return false
     const binary = await helper()
     if (binary === undefined) {
       entry.error = 'capture-failed'
       return false
     }
-    if (disposed || !entry.target.active || entries.get(id) !== entry) return false
+    if (disposed || !entry.target.active || entries.get(id) !== entry || blocked(entry)) return false
     if (entry.stream !== undefined) return true
+    delete entry.error
     /** @type {Stream} */
     const stream = { proc: /** @type {any} */ (undefined), edge, viewers: new Map() }
     entry.stream = stream
@@ -467,10 +532,18 @@ export function apply(ctx) {
     return found
   }
 
+  // 冻结帧按时清：原来只在投影变化时顺手清，没有新的操控就一直留着（2026-11-02 审查）
+  const sweeper = setInterval(() => evict(Date.now()), EVICT_EVERY_MS)
+  sweeper.unref?.()
+
   ctx.effect(() => () => {
     disposed = true
+    clearInterval(sweeper)
     for (const entry of entries.values()) stopStream(entry)
     entries.clear()
+    // 补拍中的辅助程序也停掉（原来要等 4 秒超时才停）
+    for (const proc of snapshotProcs) killHelper(proc)
+    snapshotProcs.clear()
   }, 'computer-plus: frames')
 
   ctx.inject(['systemPrompt'], (/** @type {any} */ scope) => {
@@ -490,9 +563,10 @@ export function apply(ctx) {
       kind: 'prefix',
       path: COMPUTER_PATH,
       handler: async (/** @type {import('node:http').IncomingMessage} */ req, /** @type {import('node:http').ServerResponse} */ res) => {
-        if (!admitted(scope, ctx, req)) {
-          res.writeHead(401)
-          res.end('unauthorized')
+        const refused = admission(scope, ctx, req)
+        if (refused !== 0) {
+          res.writeHead(refused)
+          res.end(refused === 401 ? 'unauthorized' : 'forbidden')
           return
         }
         const url = new URL(req.url ?? '/', 'http://x')
@@ -502,6 +576,8 @@ export function apply(ctx) {
           return
         }
         const id = url.searchParams.get('session') ?? ''
+        // 先清过期的：别让一次请求把早该清掉的冻结帧续上命
+        evict(Date.now())
         const entry = entries.get(id)
         if (entry === undefined) {
           res.writeHead(204, { 'cache-control': 'no-store' })
@@ -528,7 +604,8 @@ export function apply(ctx) {
         }
 
         if (route === '/icon') {
-          const png = await iconOf(entry.target.pid)
+          // 地址里的 pid 是客户端当时的目标：对不上（请求晚到、已经换了应用）就不给，免得别的应用的图标按这个地址缓存一小时
+          const png = url.searchParams.get('pid') === String(entry.target.pid) ? await iconOf(entry.target.pid) : null
           if (png === null) {
             res.writeHead(204, { 'cache-control': 'no-store' })
             res.end()
@@ -575,7 +652,9 @@ export function apply(ctx) {
         // 回合刚结束、补拍还没拍完（面板正开着就会碰上）：等它拍完再回，不先回「没有画面」
         if (entry.frame === undefined && entry.capturing !== undefined) await entry.capturing
         const frame = entry.frame
-        if (frame === undefined) {
+        // 进行中但这一步起不了流（窗口关了、中途停了、没权限）：说明原因，客户端就停在提示上，不再每 2 秒重连
+        const halted = entry.target.active && entry.error !== undefined && blocked(entry)
+        if (frame === undefined || halted) {
           if (entry.error !== undefined) sendJson(res, 503, { error: entry.error })
           else {
             res.writeHead(204, { 'cache-control': 'no-store' })

@@ -10,20 +10,24 @@
 
 | 工具 | 作用 |
 | --- | --- |
-| `computer_launch_app` | 在后台打开（或找到）应用，返回 pid |
+| `computer_launch_app` | 在后台打开（或找到）应用，返回 pid；窗口已就绪时一并给出 window_id |
 | `computer_list_windows` | 列出窗口的 pid、window_id |
-| `computer_get_window_state` | 读一个窗口的界面树（可操作元素编号 [N]）和截图 |
+| `computer_get_window_state` | 读一个窗口的界面树（可操作元素编号 [N]）和截图；默认去掉应用菜单栏 |
 | `computer_click` | 按元素编号或截图像素点击 |
-| `computer_type_text` | 输入文字 |
-| `computer_press_key` | 按键 / 快捷键 |
+| `computer_type_text` | 输入文字（网页、Electron 的输入框可传 x/y，先在那里点一下再输入） |
+| `computer_press_key` | 按键 / 快捷键（同样可传 x/y） |
 | `computer_scroll` | 滚动 |
 
-每个 DSH 对话用一个固定的 cua-driver session（`dsh-` + 对话 id 的哈希），回合结束时插件结束它，下一轮自动重新开始。
+参数先按 schema 校验，不合格直接报错给 Agent，不带着错的值去操作。菜单命令、拖动、需要窗口在前台的操作不在这组工具里，Agent 用 bash 调 cua-driver（面板不显示这些步骤）。
+
+每个 DSH 对话用一个固定的 cua-driver session（`dsh-` + 对话 id 的哈希），回合结束时插件结束它，下一轮自动重新开始。回合结束时 CuaDriver 没在运行就不去启动它。
+
+面板路由 `/computer-plus/*` 用和 `/api` 同一套登录校验，并且只给本机主人看。
 
 ## 依赖
 
 - macOS，装好 cua-driver（`~/.local/bin`、`/opt/homebrew/bin` 或 `/usr/local/bin`），并授予辅助功能和屏幕录制权限
-- 实时画面要 Xcode 命令行工具（首次用到时用 `swiftc` 编译 `assets/computer-stream.swift`，产物在 `~/Library/Caches/dsh-computer-plus`）
+- 实时画面要 Xcode 命令行工具（首次用到时用 `swiftc` 编译 `assets/computer-stream.swift`，产物在 `~/Library/Caches/dsh-computer-plus`）。没装就不编，不会弹系统的安装对话框，只是没有画面
 - 面板来自 dsh-harness-plus 的对话信息面板，它声明插槽 `harness.session-info.computer`；没装它时工具照常能用，只是没有画面
 
 ## 开发

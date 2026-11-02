@@ -35,13 +35,42 @@ test('投影：调用 → 结果补应用名 → 回合结束冻结并记下怎�
   const s1 = fold([call('computer_get_window_state', { pid: 5, window_id: 7 })])
   assert.deepEqual(s1, { pid: 5, windowId: 7, tool: 'computer_get_window_state', active: true, at: 10, callId: 'c1' })
   const s2 = step(s1, result('c1', { pid: 5, windowId: 7, appName: '计算器' }))
-  assert.deepEqual(s2, { pid: 5, windowId: 7, tool: 'computer_get_window_state', appName: '计算器', active: true, at: 20 })
+  assert.deepEqual(s2, { pid: 5, windowId: 7, tool: 'computer_get_window_state', appName: '计算器', names: { 5: '计算器' }, active: true, at: 20 })
   const s3 = step(s2, turnEnd())
-  assert.deepEqual(s3, { pid: 5, windowId: 7, tool: 'computer_get_window_state', appName: '计算器', active: false, ended: 'completed', at: 20 })
+  assert.deepEqual(s3, { pid: 5, windowId: 7, tool: 'computer_get_window_state', appName: '计算器', names: { 5: '计算器' }, active: false, ended: 'completed', at: 20 })
+  assert.deepEqual(computerProjection.wire.view(s3 as any), { pid: 5, windowId: 7, tool: 'computer_get_window_state', appName: '计算器', active: false, ended: 'completed', at: 20 }, '记账用的字段不发给客户端')
   assert.equal(step(s3, turnEnd('aborted', 40)), s3, '已结束的不再改')
   assert.equal(fold([call('computer_click', { pid: 5, window_id: 7 }), turnEnd('aborted')]).ended, 'aborted')
   assert.equal(fold([call('computer_click', { pid: 5, window_id: 7 }), turnEnd('interrupted')]).ended, 'aborted')
   assert.equal(fold([call('computer_click', { pid: 5, window_id: 7 }), turnEnd('error')]).ended, 'error')
+})
+
+test('投影：输出到上限、被拦下这类结束不算出错，算已停止（不打勾）', () => {
+  for (const kind of ['max-tokens', 'blocked', 'disposed']) {
+    assert.equal(fold([call('computer_click', { pid: 5, window_id: 7 }), turnEnd(kind)]).ended, 'aborted', kind)
+  }
+})
+
+test('投影：换到新窗口的调用失败了就退回上一个窗口（传错 pid、按停止后没执行的调用）', () => {
+  const named = fold([call('computer_get_window_state', { pid: 5, window_id: 7 }), result('c1', { pid: 5, windowId: 7, appName: '计算器' })])
+  const wrong = step(named, call('computer_click', { pid: 99, window_id: 98 }, 30, 'c2'))
+  assert.equal(wrong.pid, 99, '调用一开始就切过去，面板不慢一步')
+  const failed = step(wrong, { ...result('c2', undefined, 40), data: { message: { toolCallId: 'c2', isError: true } } })
+  assert.deepEqual({ pid: failed.pid, windowId: failed.windowId, appName: failed.appName, active: failed.active }, { pid: 5, windowId: 7, appName: '计算器', active: true })
+  assert.equal(failed.callId, undefined)
+  assert.equal(failed.previous, undefined)
+  // 同一个窗口里的调用失败：留在原地
+  const same = step(named, call('computer_click', { pid: 5, window_id: 7 }, 30, 'c3'))
+  const sameFailed = step(same, { ...result('c3', undefined, 40), data: { message: { toolCallId: 'c3', isError: true } } })
+  assert.equal(sameFailed.windowId, 7)
+})
+
+test('投影：从 A 换到 B 再回到 A，A 的应用名还在', () => {
+  const a = fold([call('computer_get_window_state', { pid: 5, window_id: 7 }), result('c1', { pid: 5, windowId: 7, appName: '计算器' })])
+  const b = step(step(a, call('computer_get_window_state', { pid: 9, window_id: 3 }, 30, 'c2')), result('c2', { pid: 9, windowId: 3, appName: '备忘录' }, 40))
+  assert.equal(b.appName, '备忘录')
+  const back = step(b, call('computer_click', { pid: 5, window_id: 7 }, 50, 'c3'))
+  assert.equal(back.appName, '计算器')
 })
 
 test('投影：结果里的应用名必须是同一个窗口的', () => {
@@ -181,10 +210,10 @@ test('界面树默认去掉菜单栏（计算器的树 86% 是菜单），元素
   assert.deepEqual(withoutMenuBar('- [0] AXWindow "x"'), { tree: '- [0] AXWindow "x"', removed: 0 }, '没有菜单栏原样返回')
 })
 
-test('去掉菜单栏时告诉模型怎么要回来', () => {
+test('去掉菜单栏时告诉模型菜单命令该怎么执行（invoke_menu，不点后台应用的菜单项）', () => {
   const text = stateText({ pid: 5, window_id: 7, snapshot_id: 's1', tree: '- [0] AXWindow', menu_items_hidden: 123 })
   assert.match(text, /menu bar \(123 items\) is hidden/)
-  assert.match(text, /include_menu_bar: true/)
+  assert.match(text, /invoke_menu/)
   assert.doesNotMatch(stateText({ pid: 5, window_id: 7, snapshot_id: 's1', tree: '' }), /menu bar/)
 })
 
@@ -213,6 +242,6 @@ test('动作结果去掉 cua-driver 让 Agent 用 delivery_mode 重试的建议�
 
 test('回合结束时补拍一帧：面板没开着也留下冻结画面（2026-11-02 真机「本轮没有留下画面」）', () => {
   const src = readFileSync(new URL('../src/index.js', import.meta.url), 'utf8')
-  assert.match(src, /if \(!target\.active && wasActive\) snapshot\(id, entry\)/, '只在这一轮结束时拍，不每步拍')
+  assert.match(src, /if \(!target\.active && wasActive && !\(wasStreaming && entry === current && entry\.frame !== undefined\)\) snapshot\(id, entry\)/, '只在这一轮结束时拍，不每步拍；面板开着在取流就不再拍')
   assert.match(src, /entry\.capturing !== undefined\) await entry\.capturing/, '取冻结帧时等补拍完成')
 })

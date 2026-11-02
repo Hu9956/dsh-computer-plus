@@ -30,7 +30,7 @@ export interface ComputerTarget {
   callId?: string
 }
 
-export type ComputerError = 'window-gone' | 'capture-failed' | 'unsupported'
+export type ComputerError = 'window-gone' | 'capture-failed' | 'capture-stopped' | 'unsupported' | 'unauthorized'
 
 export interface ComputerFrame {
   /** 进行中是 MJPEG 流的 URL，结束后是最后一帧的 object URL */
@@ -55,13 +55,17 @@ export function asComputerTarget(value: unknown): ComputerTarget | undefined {
   return v as ComputerTarget
 }
 
-const ERRORS: readonly ComputerError[] = ['window-gone', 'capture-failed', 'unsupported']
+const ERRORS: readonly ComputerError[] = ['window-gone', 'capture-failed', 'capture-stopped', 'unsupported', 'unauthorized']
 const asError = (value: unknown): ComputerError | undefined => ERRORS.includes(value as ComputerError) ? value as ComputerError : undefined
+/** 登录失效（401）、不让看（403）：再请求也一样，停下来 */
+const refused = (status: number) => status === 401 || status === 403
 
 /** 占位区的文字：有画面时不显示 */
 export function screenNote(target: ComputerTarget | undefined, frame: ComputerFrame, preparing = false): string {
+  if (frame.error === 'unauthorized') return '登录已失效，刷新页面后再看画面'
   if (frame.error === 'window-gone') return '窗口已关闭'
   if (frame.error === 'unsupported') return '当前系统不支持显示画面'
+  if (frame.error === 'capture-stopped') return '画面中断了（可能是锁屏或停止了录屏），Agent 下一步时再试'
   if (frame.error === 'capture-failed') return '截不到画面，请在系统设置里给 DeepSeek Harness 打开屏幕录制权限'
   if (target === undefined) return 'Agent 操控电脑时，画面显示在这里'
   if (!target.active) return '本轮没有留下画面'
@@ -84,7 +88,7 @@ export function appStatus(target: ComputerTarget | undefined): string {
   return '已完成'
 }
 
-/** 应用图标地址：pid 进 URL，换应用就是新图（host 只给当前目标的图标，pid 对不上回 204） */
+/** 应用图标地址：pid 进 URL，换应用就是新图（host 只给当前目标的图标，pid 对不上回 204、不缓存） */
 export const appIconUrl = (sessionId: string, target: ComputerTarget | undefined) =>
   target === undefined ? undefined : `${BASE}/icon?${query(sessionId)}&pid=${target.pid}`
 
@@ -155,17 +159,19 @@ export function useComputerFrame(sessionId: string, target: ComputerTarget | und
         } else if (res.status === 503) {
           const body = await res.json().catch(() => ({})) as { error?: unknown }
           setFrame(current => ({ ...current, error: asError(body.error) ?? 'capture-failed' }))
+        } else if (refused(res.status)) {
+          setFrame(current => ({ ...current, error: 'unauthorized' }))
         }
       })
       .catch(() => { /* 断网、被中止：没有冻结帧就显示文字 */ })
     return () => controller.abort()
   }, [sessionId, surface, enabled, active])
 
-  // Agent 又做了一步：之前停在错误提示上的，清掉原因再连一次
+  // Agent 又做了一步：之前停在错误提示上的，清掉原因再连一次（登录失效除外：要刷新页面）
   const retry = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   useEffect(() => () => clearTimeout(retry.current), [sessionId, surface])
   const hasError = useRef(false)
-  hasError.current = frame.error !== undefined
+  hasError.current = frame.error !== undefined && frame.error !== 'unauthorized'
   const at = target?.at
   useEffect(() => {
     if (!hasError.current) return
@@ -176,7 +182,8 @@ export function useComputerFrame(sessionId: string, target: ComputerTarget | und
   const onError = () => {
     if (!streaming) return
     fetch(`${BASE}/frame?${query(sessionId)}`, { credentials: 'same-origin', cache: 'no-store' })
-      .then(async (res) => {
+      .then(async (res): Promise<ComputerError | undefined> => {
+        if (refused(res.status)) return 'unauthorized'
         if (res.status !== 503) return undefined
         const body = await res.json().catch(() => ({})) as { error?: unknown }
         return asError(body.error) ?? 'capture-failed'
@@ -184,8 +191,8 @@ export function useComputerFrame(sessionId: string, target: ComputerTarget | und
       .catch(() => undefined)
       .then((error) => {
         if (error !== undefined) setFrame(current => ({ ...current, error }))
-        // 窗口关了、截不到（没权限）：再连也一样，停在提示上，等 Agent 下一步
-        if (error === 'window-gone' || error === 'capture-failed' || error === 'unsupported') return
+        // 窗口关了、截不到、中途停了、登录失效：再连也一样，停在提示上，等 Agent 下一步（登录失效要刷新页面）
+        if (error !== undefined) return
         clearTimeout(retry.current)
         retry.current = setTimeout(() => {
           setFrame(current => current.error === undefined ? current : { ...current, error: undefined })
@@ -221,7 +228,11 @@ export function useComputerStatus(sessionId: string, target: ComputerTarget | un
     const controller = new AbortController()
     const tick = () => {
       fetch(`${BASE}/status?${query(sessionId)}`, { credentials: 'same-origin', cache: 'no-store', signal: controller.signal })
-        .then(res => res.status === 200 ? res.json() as Promise<{ point?: unknown, clicks?: unknown, preparing?: unknown }> : undefined)
+        .then((res) => {
+          // 登录失效、不让看：不再每 250ms 问一次（刷新页面或下一轮再来）
+          if (refused(res.status)) stopped = true
+          return res.status === 200 ? res.json() as Promise<{ point?: unknown, clicks?: unknown, preparing?: unknown }> : undefined
+        })
         .then((body) => {
           if (stopped || body === undefined) return
           setPreparing(body.preparing === true)

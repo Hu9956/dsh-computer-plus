@@ -47,11 +47,12 @@ const MAX_ERROR_TEXT = 4000
  * @param {string[]} args
  * @param {AbortSignal | undefined} signal
  * @param {number} timeout
+ * @param {NodeJS.ProcessEnv} [env] 不给就用本进程的
  * @returns {Promise<RunResult>}
  */
-export function runFile(file, args, signal, timeout) {
+export function runFile(file, args, signal, timeout, env) {
   return new Promise((done, fail) => {
-    execFile(file, args, { timeout, maxBuffer: MAX_OUTPUT, encoding: 'utf8', ...(signal === undefined ? {} : { signal }) }, (error, stdout, stderr) => {
+    execFile(file, args, { timeout, maxBuffer: MAX_OUTPUT, encoding: 'utf8', ...(signal === undefined ? {} : { signal }), ...(env === undefined ? {} : { env }) }, (error, stdout, stderr) => {
       const err = /** @type {any} */ (error)
       if (err === null || err === undefined) return done({ code: 0, stdout: String(stdout ?? ''), stderr: String(stderr ?? '') })
       if (err.name === 'AbortError' || err.code === 'ABORT_ERR') return fail(err)
@@ -62,7 +63,9 @@ export function runFile(file, args, signal, timeout) {
   })
 }
 
-const needsDaemon = (/** @type {RunResult} */ r) => /daemon is not running/i.test(`${r.stdout}\n${r.stderr}`)
+// 只看失败时的 stderr（实测 0.30.4：守护进程不在时退出码 1、stdout 为空、stderr「Cua Driver daemon is not running on …」）。
+// 不能看 stdout：成功的结果里可能带这句话（窗口里正显示着这行字），误判会把已经做成的点击再做一次（2026-11-02 审查）
+const needsDaemon = (/** @type {RunResult} */ r) => r.code !== 0 && /daemon is not running/i.test(r.stderr)
 const sessionEnded = (/** @type {RunResult} */ r) => r.code !== 0 && /session has ended/i.test(`${r.stdout}\n${r.stderr}`)
 
 /**
@@ -103,6 +106,22 @@ export function createDriver(options = {}) {
   const startDaemon = (cua) => (starting ??= (options.startDaemon ?? defaultStartDaemon)(cua).finally(() => { starting = undefined }))
 
   /**
+   * 等守护进程启动，但用户按停止就不再等（启动本身继续，下一次调用会用上）
+   * @param {string} cua
+   * @param {AbortSignal | undefined} signal
+   */
+  const awaitDaemon = (cua, signal) => {
+    const started = startDaemon(cua)
+    if (signal === undefined) return started
+    signal.throwIfAborted()
+    return new Promise((done, fail) => {
+      const onAbort = () => fail(signal.reason)
+      signal.addEventListener('abort', onAbort, { once: true })
+      started.then(done, fail).finally(() => signal.removeEventListener('abort', onAbort))
+    })
+  }
+
+  /**
    * @param {string} tool
    * @param {Record<string, unknown>} args
    * @param {AbortSignal | undefined} signal
@@ -114,7 +133,7 @@ export function createDriver(options = {}) {
     let result = await runFile(cua, ['call', tool, JSON.stringify(args)], signal, timeout)
     if (needsDaemon(result)) {
       options.logger?.info?.('computer-plus: cua-driver daemon not running, starting it')
-      await startDaemon(cua)
+      await awaitDaemon(cua, signal)
       result = await runFile(cua, ['call', tool, JSON.stringify(args)], signal, timeout)
     }
     return result
@@ -140,24 +159,28 @@ export function createDriver(options = {}) {
       const { signal, timeout = 30_000, label } = opts
       const full = label === undefined ? args : { ...args, session: label }
       if (label !== undefined && ended.has(label)) await revive(label, signal)
+      // 先记下：调用被中断或超时，守护进程那边可能已经建了 session、亮了光标，回合结束时也要结束它
+      if (label !== undefined) live.add(label)
       let result = await once(tool, full, signal, timeout)
       // 名字被结束过（DSH 重启前结束的，这个进程不知道）：被拒绝的调用没有执行，start_session 后重试一次是安全的
       if (label !== undefined && sessionEnded(result)) {
         await revive(label, signal)
         result = await once(tool, full, signal, timeout)
       }
-      if (label !== undefined) live.add(label)
       return parseResult(tool, result)
     },
     /**
-     * 回合结束：结束这个对话的 cua-driver session（光标叠加层随之消失）。只结束本进程用过的；失败不管
+     * 回合结束：结束这个对话的 cua-driver session（光标叠加层随之消失）。只结束本进程用过的；失败不管。
+     * 守护进程不在就算了，不去启动它：用户可能是特意退出 CuaDriver 收回控制权（2026-11-02 审查）
      * @param {string} label
      */
     async endSession(label) {
       if (!live.has(label)) return
       live.delete(label)
       ended.add(label)
-      try { await once('end_session', { session: label }, undefined, 10_000) } catch { /* 守护进程没了也无所谓 */ }
+      const cua = await path()
+      if (cua === undefined) return
+      await runFile(cua, ['call', 'end_session', JSON.stringify({ session: label })], undefined, 10_000).catch(() => {})
     },
     /**
      * 只读调用（面板用：list_windows、get_agent_cursor_state）。不代填、不启动守护进程以外的任何东西
@@ -178,11 +201,26 @@ export function createDriver(options = {}) {
 /** @typedef {ReturnType<typeof createDriver>} Driver */
 
 /**
+ * 启动守护进程时不带的环境变量。DSH 自己是 Electron 应用，给子进程设了 ELECTRON_RUN_AS_NODE=1；
+ * `open` 会把调用方的环境原样交给 CuaDriver，守护进程再交给它启动的每个应用，
+ * Cursor、Slack 这类 Electron 应用带着它会当成纯 Node 启动、两秒就退出
+ * （2026-11-02 真机：launch_app 打开 Cursor 两次都秒退；用探针应用确认守护进程启动的应用带着这个变量）
+ */
+const DAEMON_ENV_DROP = ['ELECTRON_RUN_AS_NODE', 'ELECTRON_NO_ATTACH_CONSOLE', 'NODE_OPTIONS']
+
+/** 给守护进程用的环境：去掉上面那几个 @param {NodeJS.ProcessEnv} [env] */
+export function daemonEnv(env = process.env) {
+  const out = { ...env }
+  for (const key of DAEMON_ENV_DROP) delete out[key]
+  return out
+}
+
+/**
  * 按 cua-driver 文档启动守护进程：经 LaunchServices 打开 CuaDriver.app（权限算在 CuaDriver 名下），等它就绪
  * @param {string} cua
  */
 async function defaultStartDaemon(cua) {
-  await runFile('/usr/bin/open', ['-n', '-g', '-a', 'CuaDriver', '--args', 'serve'], undefined, 10_000)
+  await runFile('/usr/bin/open', ['-n', '-g', '-a', 'CuaDriver', '--args', 'serve'], undefined, 10_000, daemonEnv())
   for (let i = 0; i < 16; i++) {
     await new Promise(r => setTimeout(r, 500))
     const status = await runFile(cua, ['status'], undefined, 4000).catch(() => undefined)
