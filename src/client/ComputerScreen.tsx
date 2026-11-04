@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom'
 import {
   appName,
   contentRect,
+  cornerClip,
   screenNote,
   showDoneBadge,
   useBoxSize,
@@ -10,6 +11,7 @@ import {
   useComputerStatus,
   type ComputerStatus,
   type ComputerTarget,
+  type Corners,
 } from './computer'
 
 /**
@@ -34,12 +36,14 @@ export function ComputerScreen({ sessionId, target, enabled }: {
   const label = `${appName(target)} 的画面`
   const active = target?.active === true
   const done = showDoneBadge(target)
+  // 窗口圆角：进行中跟着 /status 走，结束后用冻结帧自己带的（没有就沿用最后一次 /status 的）
+  const corners = active ? status.corners : frame.corners ?? status.corners
   return (
     <>
-      <Frame className="cp-screen" url={frame.url!} label={label} active={active} done={done} status={status} onError={frame.onError} onOpen={() => setZoomed(true)} />
+      <Frame className="cp-screen" url={frame.url!} label={label} active={active} done={done} status={status} corners={corners} onError={frame.onError} onOpen={() => setZoomed(true)} />
       {zoomed && createPortal(
         <ZoomView label={label} onClose={() => setZoomed(false)}>
-          <Frame className="cp-zoom-frame" url={frame.url!} label={label} active={active} done={done} status={status} onError={frame.onError} />
+          <Frame className="cp-zoom-frame" url={frame.url!} label={label} active={active} done={done} status={status} corners={corners} onError={frame.onError} />
         </ZoomView>,
         document.body,
       )}
@@ -48,13 +52,14 @@ export function ComputerScreen({ sessionId, target, enabled }: {
 }
 
 /** 一块画面：图片 + 按实际区域摆的光标。onOpen 有值时整块可点（面板里那块），放大里那块不可点 */
-function Frame({ className, url, label, active, done, status, onError, onOpen }: {
+function Frame({ className, url, label, active, done, status, corners, onError, onOpen }: {
   className: string
   url: string
   label: string
   active: boolean
   done: boolean
   status: ComputerStatus
+  corners: Corners | undefined
   onError: () => void
   onOpen?: () => void
 }) {
@@ -68,6 +73,8 @@ function Frame({ className, url, label, active, done, status, onError, onOpen }:
     return () => { node?.removeAttribute('src') }
   }, [])
   const area = contentRect(size, natural)
+  // 按窗口真实的圆角裁掉四角（裁的是图片实际所在的区域，竖窗口两边的留白不受影响）
+  const clip = cornerClip(size, area, corners)
   const open = onOpen === undefined
     ? {}
     : {
@@ -90,6 +97,7 @@ function Frame({ className, url, label, active, done, status, onError, onOpen }:
         src={url}
         alt={label}
         draggable={false}
+        style={clip === undefined ? undefined : { clipPath: clip }}
         onLoad={(event) => {
           const node = event.currentTarget
           setNatural(current => current?.w === node.naturalWidth && current.h === node.naturalHeight ? current : { w: node.naturalWidth, h: node.naturalHeight })

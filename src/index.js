@@ -117,6 +117,24 @@ export function writeMjpeg(res, bytes) {
   res.write('\r\n')
 }
 
+const CORNER_MAGIC = Buffer.from('CPR1')
+
+/**
+ * 拆下辅助程序接在 JPEG 后面的「角」：4 个 UInt16 大端（左上、右上、右下、左下的圆角半径，占图宽的万分之几）+ "CPR1"。
+ * 窗口圆角外是透明的，JPEG 没有透明，面板按这个半径把角裁掉（2026-11-04 用户截图：四个白角）。
+ * 没有这段（旧版辅助程序、显示器画面）就原样返回、corners 为 undefined
+ * @param {Buffer} frame
+ * @returns {{ jpeg: Buffer, corners?: number[] }}
+ */
+export function splitCorners(frame) {
+  if (frame.length < 12 + 2 || !frame.subarray(frame.length - 4).equals(CORNER_MAGIC)) return { jpeg: frame }
+  const at = frame.length - 12
+  const corners = [0, 1, 2, 3].map(i => frame.readUInt16BE(at + i * 2))
+  const jpeg = frame.subarray(0, at)
+  if (corners.some(r => r > 10_000)) return { jpeg }
+  return corners.some(r => r > 0) ? { jpeg, corners } : { jpeg }
+}
+
 /**
  * 编译取流辅助程序（只在 macOS、只编一次，产物按源码哈希命名）。没有 swiftc 或编译失败返回 undefined
  * @param {any} logger
@@ -191,7 +209,7 @@ function sendJson(res, status, data) {
  * }} Stream
  * @typedef {{
  *   target: ComputerTarget,
- *   frame?: { bytes: Buffer, etag: string },
+ *   frame?: { bytes: Buffer, etag: string, corners?: number[] },
  *   frameAt?: number,
  *   capturing?: Promise<void>,
  *   error?: string,
@@ -278,12 +296,13 @@ export function apply(ctx) {
 
   /**
    * @param {Entry} entry
-   * @param {Buffer} bytes
+   * @param {Buffer} raw 辅助程序给的一帧（JPEG + 可能接着的「角」）
    */
-  const publish = (entry, bytes) => {
+  const publish = (entry, raw) => {
+    const { jpeg: bytes, corners } = splitCorners(raw)
     const etag = `"${createHash('sha1').update(bytes).digest('base64url')}"`
     if (entry.frame?.etag === etag) return
-    entry.frame = { bytes, etag }
+    entry.frame = { bytes, etag, ...(corners === undefined ? {} : { corners }) }
     entry.frameAt = Date.now()
     delete entry.error
     for (const res of entry.stream?.viewers.keys() ?? []) writeMjpeg(res, bytes)
@@ -601,6 +620,7 @@ export function apply(ctx) {
             point: entry.target.active ? entry.cursor?.point ?? null : null,
             clicks: entry.clicks,
             preparing: helperBuilding,
+            ...(entry.frame?.corners === undefined ? {} : { corners: entry.frame.corners }),
             ...(entry.error === undefined ? {} : { error: entry.error }),
           })
           return
@@ -676,7 +696,13 @@ export function apply(ctx) {
           res.end()
           return
         }
-        res.writeHead(200, { 'cache-control': 'no-store', 'content-type': 'image/jpeg', etag: frame.etag, 'content-length': String(frame.bytes.length) })
+        res.writeHead(200, {
+          'cache-control': 'no-store',
+          'content-type': 'image/jpeg',
+          etag: frame.etag,
+          'content-length': String(frame.bytes.length),
+          ...(frame.corners === undefined ? {} : { 'x-computer-corners': frame.corners.join(',') }),
+        })
         res.end(frame.bytes)
       },
     }), 'computer-plus: panel routes')

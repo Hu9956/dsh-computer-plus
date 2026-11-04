@@ -84,12 +84,74 @@ func fit(_ size: CGSize) -> (Int, Int) {
 let ciContext = CIContext()
 let output = FileHandle.standardOutput
 
-func jpeg(_ cg: CGImage) -> Data? {
+/// 窗口四角：圆角半径（占图宽的万分之几，顺序 左上 右上 右下 左下）和边缘颜色。
+/// 截到的窗口圆角外是透明的，JPEG 没有透明，编码器会把它填成白色，面板上就是四个白角（2026-11-04 用户截图）。
+/// 半径每个窗口不一样（实测计算器约 27px、终端 17～20px，长边 640 时），所以每帧量：
+/// 沿对角线从角往里走，碰到不透明的点停下，圆弧和对角线交在 (1-√2/2)·r 处，反推 r
+struct Corners {
+  var radii: [UInt16] = [0, 0, 0, 0]
+  var fill: (CGFloat, CGFloat, CGFloat)?
+}
+
+func measureCorners(_ cg: CGImage) -> Corners? {
+  let w = cg.width, h = cg.height
+  guard w >= 8, h >= 8, let space = CGColorSpace(name: CGColorSpace.sRGB) else { return nil }
+  var buf = [UInt8](repeating: 0, count: w * h * 4)
+  let ok: Bool = buf.withUnsafeMutableBytes { raw in
+    guard let ctx = CGContext(data: raw.baseAddress, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                              space: space, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return false }
+    ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+    return true
+  }
+  guard ok else { return nil }
+  // 位图的第 0 行是图的最上面一行
+  var corners = Corners()
+  var sum = (0.0, 0.0, 0.0), n = 0.0
+  let limit = min(w, h) / 3
+  for (i, (ox, oy, dx, dy)) in [(0, 0, 1, 1), (w - 1, 0, -1, 1), (w - 1, h - 1, -1, -1), (0, h - 1, 1, -1)].enumerated() {
+    var d = 0
+    while d < limit {
+      let p = ((oy + dy * d) * w + (ox + dx * d)) * 4
+      if buf[p + 3] >= 250 {
+        sum.0 += Double(buf[p]); sum.1 += Double(buf[p + 1]); sum.2 += Double(buf[p + 2]); n += 1
+        break
+      }
+      d += 1
+    }
+    if d == 0 || d >= limit { continue }
+    let r = Double(d) / (1 - 0.5.squareRoot())
+    corners.radii[i] = UInt16(min(10_000, (r / Double(w) * 10_000).rounded()))
+  }
+  if corners.radii.contains(where: { $0 > 0 }) && n > 0 {
+    corners.fill = (CGFloat(sum.0 / n / 255), CGFloat(sum.1 / n / 255), CGFloat(sum.2 / n / 255))
+  }
+  return corners
+}
+
+/// 编码一帧：透明的角先铺成窗口边缘的颜色（不是白色），再 JPEG；JPEG 后面接 12 字节「角」：
+/// 4 个 UInt16 大端（半径，占宽的万分之几）+ "CPR1"。浏览器解 JPEG 读到结束标记就停，后面这几个字节不影响显示；
+/// 插件 host 端把它拆下来，交给面板按真实圆角裁掉角
+func jpeg(_ source: CGImage) -> Data? {
+  var cg = source
+  var radii: [UInt16] = [0, 0, 0, 0]
+  let w = source.width, h = source.height
+  if let corners = measureCorners(source), let fill = corners.fill,
+     let space = CGColorSpace(name: CGColorSpace.sRGB),
+     let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+                         space: space, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) {
+    ctx.setFillColor(CGColor(srgbRed: fill.0, green: fill.1, blue: fill.2, alpha: 1))
+    ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
+    ctx.draw(source, in: CGRect(x: 0, y: 0, width: w, height: h))
+    if let flat = ctx.makeImage() { cg = flat; radii = corners.radii }
+  }
   let data = NSMutableData()
   guard let dest = CGImageDestinationCreateWithData(data, UTType.jpeg.identifier as CFString, 1, nil) else { return nil }
   CGImageDestinationAddImage(dest, cg, [kCGImageDestinationLossyCompressionQuality: 0.7] as CFDictionary)
   guard CGImageDestinationFinalize(dest) else { return nil }
-  return data as Data
+  var out = data as Data
+  for r in radii { out.append(UInt8(r >> 8)); out.append(UInt8(r & 0xff)) }
+  out.append(contentsOf: Array("CPR1".utf8))
+  return out
 }
 
 func writeFrame(_ frame: Data) {

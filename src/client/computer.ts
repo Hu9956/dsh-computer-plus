@@ -36,7 +36,12 @@ export interface ComputerFrame {
   /** 进行中是 MJPEG 流的 URL，结束后是最后一帧的 object URL */
   url?: string
   error?: ComputerError
+  /** 冻结帧的窗口圆角（见 Corners）；进行中的流从 /status 拿 */
+  corners?: Corners
 }
+
+/** 窗口四角的圆角半径：占图宽的万分之几，顺序 左上、右上、右下、左下（host 从辅助程序的帧里拆出来） */
+export type Corners = [number, number, number, number]
 
 export interface ComputerStatus {
   /** 窗口内比例位置 0～1；null = 不画 */
@@ -45,6 +50,33 @@ export interface ComputerStatus {
   ripple: number
   /** 辅助程序在第一次编译 */
   preparing: boolean
+  /** 当前画面的窗口圆角；没有（旧版辅助程序、还没出帧）就不裁 */
+  corners?: Corners
+}
+
+/** /status 的 corners 数组或 /frame 的 x-computer-corners 头（"759,759,854,854"）→ Corners；形状不对就当没有 */
+export function parseCorners(value: unknown): Corners | undefined {
+  const list = typeof value === 'string' ? value.split(',').map(Number) : value
+  if (!Array.isArray(list) || list.length !== 4) return undefined
+  if (!list.every(n => typeof n === 'number' && Number.isFinite(n) && n >= 0 && n <= 10_000)) return undefined
+  return list as Corners
+}
+
+const sameCorners = (a: Corners | undefined, b: Corners | undefined) =>
+  a === b || (a !== undefined && b !== undefined && a.every((n, i) => n === b[i]))
+
+/**
+ * 按窗口真实圆角裁图片的 clip-path（2026-11-04：截到的窗口圆角外是透明的，JPEG 没有透明，四个角原来是白的）。
+ * 辅助程序已经把角铺成窗口边缘的颜色，这里再按半径裁掉，露出框的底色，看起来就是圆角窗口。
+ * 图片元素铺满整个框（object-fit: contain），所以先按实际画面区域内缩，再给四个角圆角。
+ */
+export function cornerClip(box: { w: number, h: number }, area: { left: number, top: number, width: number, height: number } | undefined, corners: Corners | undefined): string | undefined {
+  if (area === undefined || corners === undefined || box.w <= 0 || box.h <= 0) return undefined
+  const px = (n: number) => `${Math.max(0, Math.round(n * 100) / 100)}px`
+  const radius = corners.map(r => px(r / 10_000 * area.width)).join(' ')
+  const right = box.w - area.left - area.width
+  const bottom = box.h - area.top - area.height
+  return `inset(${px(area.top)} ${px(right)} ${px(bottom)} ${px(area.left)} round ${radius})`
 }
 
 /** 投影值规整成 ComputerTarget；形状不对就当没有 */
@@ -151,11 +183,12 @@ export function useComputerFrame(sessionId: string, target: ComputerTarget | und
     fetch(`${BASE}/frame?${query(sessionId)}`, { credentials: 'same-origin', cache: 'no-store', signal: controller.signal })
       .then(async (res) => {
         if (res.status === 200) {
+          const corners = parseCorners(res.headers.get('x-computer-corners'))
           const next = URL.createObjectURL(await res.blob())
           if (controller.signal.aborted) { URL.revokeObjectURL(next); return }
           if (blobUrl.current !== undefined) URL.revokeObjectURL(blobUrl.current)
           blobUrl.current = next
-          setFrame({ url: next })
+          setFrame(corners === undefined ? { url: next } : { url: next, corners })
         } else if (res.status === 503) {
           const body = await res.json().catch(() => ({})) as { error?: unknown }
           setFrame(current => ({ ...current, error: asError(body.error) ?? 'capture-failed' }))
@@ -213,11 +246,14 @@ export function useComputerStatus(sessionId: string, target: ComputerTarget | un
   const [point, setPoint] = useState<ComputerStatus['point']>(null)
   const [ripple, setRipple] = useState(0)
   const [preparing, setPreparing] = useState(false)
+  const [corners, setCorners] = useState<Corners | undefined>(undefined)
   const visible = usePageVisible()
   const surface = surfaceOf(target)
   const active = target?.active === true
 
   useEffect(() => { setPoint(null); setPreparing(false) }, [sessionId, surface, active])
+  // 换窗口：上一个窗口的圆角不能套到新窗口上
+  useEffect(() => { setCorners(undefined) }, [sessionId, surface])
 
   const clicks = useRef<number | undefined>(undefined)
   useEffect(() => {
@@ -231,11 +267,13 @@ export function useComputerStatus(sessionId: string, target: ComputerTarget | un
         .then((res) => {
           // 登录失效、不让看：不再每 250ms 问一次（刷新页面或下一轮再来）
           if (refused(res.status)) stopped = true
-          return res.status === 200 ? res.json() as Promise<{ point?: unknown, clicks?: unknown, preparing?: unknown }> : undefined
+          return res.status === 200 ? res.json() as Promise<{ point?: unknown, clicks?: unknown, preparing?: unknown, corners?: unknown }> : undefined
         })
         .then((body) => {
           if (stopped || body === undefined) return
           setPreparing(body.preparing === true)
+          const next = parseCorners(body.corners)
+          if (next !== undefined) setCorners(current => sameCorners(current, next) ? current : next)
           const p = body.point as { x?: unknown, y?: unknown } | null | undefined
           if (p !== null && typeof p === 'object' && typeof p.x === 'number' && typeof p.y === 'number') {
             const x = p.x
@@ -260,7 +298,7 @@ export function useComputerStatus(sessionId: string, target: ComputerTarget | un
     }
   }, [sessionId, surface, enabled, visible, active])
 
-  return { point, ripple, preparing }
+  return { point, ripple, preparing, ...(corners === undefined ? {} : { corners }) }
 }
 
 /** 图片在框里按 object-fit: contain 摆放后的实际区域（光标要按它摆，不是按外框） */
