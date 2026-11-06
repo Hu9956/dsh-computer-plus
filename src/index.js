@@ -226,7 +226,9 @@ function sendJson(res, status, data) {
 const HELPER_RETRY_MS = 60_000
 
 /** @param {any} ctx */
-export function apply(ctx) {
+export async function apply(ctx) {
+  // 先完成 DSH 0.2.2 的投影交接，再注册工具、监听器和路由；失败时由宿主中止激活。
+  await ctx.sessionProjections.register(computerProjection)
   const driver = createDriver({ logger: ctx.logger })
   /** @type {Map<string, Entry>} */
   const entries = new Map()
@@ -330,8 +332,6 @@ export function apply(ctx) {
       if (entry !== undefined) entry.clicks++
     },
   })
-
-  ctx.sessionProjections.register(computerProjection)
 
   // 投影一变就记下新目标（只有本进程启动后发生的操控才有画面；重启后最后一帧不保留）
   ctx.sessionProjections.onChanged((/** @type {any} */ session, /** @type {string} */ key, /** @type {unknown} */ value) => {
