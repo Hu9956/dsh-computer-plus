@@ -23,9 +23,11 @@ const PX = (axis) => ({ type: 'number', description: `${axis} in pixels of the l
 /** type_text / press_key 的坐标：cua-driver 先在这一点点一下聚焦，再输入（网页、Electron 的输入框后台按元素输入会被拒绝，它会让改用坐标）。y 只写「见 x」，每次请求都要发，不重复一遍 */
 const FOCUS_X = { type: 'number', description: 'X in screenshot pixels of the field to click first, instead of element_index. Use it for web or Electron fields when typing by element is refused. Pass with y.' }
 const FOCUS_Y = { type: 'number', description: 'Y in screenshot pixels (see x).' }
+const FOREGROUND = { type: 'boolean', description: 'Only if background failed: shows a banner, briefly fronts the window, then restores focus.' }
+const FOREGROUND_REF = { type: 'boolean', description: 'See computer_click.' }
 
-/** cua-driver 的提示里让用 delivery_mode:"foreground" 时补的一句：这组工具没有这个参数 */
-const NO_FOREGROUND = 'Note: these tools have no delivery_mode. For a web or Electron field pass its x/y; if the foreground is really needed, use cua-driver in bash.'
+/** cua-driver 的提示里让用 delivery_mode:"foreground" 时补的一句：这组工具没有 delivery_mode 参数名，改用 x/y 或 foreground:true */
+const NO_FOREGROUND = 'Note: these tools have no delivery_mode. For a web or Electron field pass its x/y first; set foreground: true only if background still fails.'
 // 报错原文是 JSON，引号是转义过的（delivery_mode:\"foreground\"），反斜杠也要认
 const mentionsForeground = (/** @type {string} */ text) => /delivery_mode\s*:\s*\\?"?foreground/i.test(text)
 
@@ -203,10 +205,16 @@ export function stateText(value) {
  *   driver: import('./driver.js').Driver,
  *   labelOf: (sessionId: string) => string,
  *   onClick?: (sessionId: string) => void,
+ *   withAppAccess?: <T>(target: { pid?: number, bundleId?: string, name?: string }, exec: any, fn: (signal?: AbortSignal) => Promise<T>) => Promise<T>,
+ *   runForeground?: <T>(sessionId: string, pid: number, signal: AbortSignal | undefined, fn: () => Promise<T>) => Promise<T>,
  * }} deps
  */
 export function registerComputerTools(ctx, deps) {
-  const { driver, labelOf, onClick } = deps
+  const { driver, labelOf, onClick, withAppAccess, runForeground } = deps
+  /** @type {<T>(target: { pid?: number, bundleId?: string, name?: string }, exec: any, fn: (signal?: AbortSignal) => Promise<T>) => Promise<T>} */
+  const guard = withAppAccess ?? ((_target, exec, fn) => fn(exec?.signal))
+  /** @type {<T>(sessionId: string, pid: number, signal: AbortSignal | undefined, fn: () => Promise<T>) => Promise<T>} */
+  const withFg = runForeground ?? ((_s, _p, _sig, fn) => fn())
   /** 每个对话、每个窗口最近一次的 snapshot_id（element_index 默认用它） */
   const snapshots = new Map()
   const snapKey = (/** @type {string} */ s, /** @type {number} */ pid, /** @type {number} */ wid) => `${s}\u0000${pid}\u0000${wid}`
@@ -250,11 +258,12 @@ export function registerComputerTools(ctx, deps) {
    * @param {Record<string, unknown>} args
    * @param {any} exec
    * @param {number} [timeout]
+   * @param {AbortSignal} [signal]
    */
-  const forward = async (tool, args, exec, timeout) => {
+  const forward = async (tool, args, exec, timeout, signal) => {
     const session = sessionOf(exec)
     try {
-      return await driver.call(tool, args, { signal: exec?.signal, label: labelOf(session), ...(timeout === undefined ? {} : { timeout }) })
+      return await driver.call(tool, args, { signal: signal ?? exec?.signal, label: labelOf(session), ...(timeout === undefined ? {} : { timeout }) })
     } catch (error) {
       if (error instanceof DriverError) throw new Error(errorText(error.message))
       throw error
@@ -310,7 +319,10 @@ export function registerComputerTools(ctx, deps) {
       output: RESULT_OUTPUT_LAUNCH(),
       async execute(/** @type {any} */ args, /** @type {any} */ exec) {
         if (typeof args.bundle_id !== 'string' && typeof args.name !== 'string') throw new Error('Pass bundle_id or name.')
-        const launched = await forward('launch_app', typeof args.bundle_id === 'string' ? { bundle_id: args.bundle_id } : { name: args.name }, exec, 60_000)
+        const selector = typeof args.bundle_id === 'string' ? { bundleId: args.bundle_id } : { name: args.name }
+        const launched = await guard(selector, exec, signal =>
+          forward('launch_app', typeof args.bundle_id === 'string' ? { bundle_id: args.bundle_id } : { name: args.name }, exec, 60_000, signal),
+        )
         return {
           pid: typeof launched.pid === 'number' ? launched.pid : null,
           name: String(launched.name ?? ''),
@@ -364,63 +376,65 @@ export function registerComputerTools(ctx, deps) {
       },
       async execute(/** @type {any} */ args, /** @type {any} */ exec) {
         const session = sessionOf(exec)
-        const wantShot = args.include_screenshot !== false
-        const attachments = wantShot ? ctx.get?.('attachments') : undefined
-        const shotOk = wantShot && attachments !== undefined && await modelTakesImages(ctx, exec)
-        /** @type {Record<string, unknown>} */
-        const request = { pid: args.pid, window_id: args.window_id, include_screenshot: shotOk }
-        if (shotOk) request.max_image_dimension = SHOT_EDGE
-        const query = typeof args.query === 'string' && args.query !== '' ? args.query : undefined
-        if (query !== undefined) request.query = query
-        // cua-driver 收 100～120000；超出范围先夹住，不让一次读树卡太久或报参数错
-        if (typeof args.timeout_ms === 'number') request.timeout_ms = Math.min(120_000, Math.max(100, args.timeout_ms))
-        // 树读得越久，命令行那边也要等得越久
-        const state = await forward('get_window_state', request, exec, 60_000 + (typeof request.timeout_ms === 'number' ? request.timeout_ms : 0))
-        const snapshot = String(state.snapshot_id ?? '')
-        if (snapshot !== '') snapshots.set(snapKey(session, args.pid, args.window_id), snapshot)
-        let tree = String(state.tree_markdown ?? '')
-        let menuHidden = 0
-        // 用了 query 时树已经只剩匹配的行，菜单栏里的匹配项说明 Agent 正在找它，不去掉（空的 query 不算用了）
-        if (args.include_menu_bar !== true && query === undefined) {
-          const trimmed = withoutMenuBar(tree)
-          tree = trimmed.tree
-          menuHidden = trimmed.removed
-        }
-        if (tree.length > MAX_TREE_CHARS) tree = `${tree.slice(0, MAX_TREE_CHARS)}\n… (tree cut at ${MAX_TREE_CHARS} characters; use query to narrow it)`
-        /** @type {Record<string, unknown>} */
-        const value = {
-          pid: args.pid,
-          window_id: args.window_id,
-          app_name: String(state.app_name ?? ''),
-          window_title: String(state.window_title ?? ''),
-          snapshot_id: snapshot,
-          tree,
-          truncated: state.truncated === true,
-          ...(state.truncated === true && typeof state.truncation_reason === 'string' ? { truncation_reason: state.truncation_reason } : {}),
-          ...(menuHidden > 0 ? { menu_items_hidden: menuHidden } : {}),
-        }
-        const b64 = typeof state.screenshot_png_b64 === 'string' ? state.screenshot_png_b64 : undefined
-        if (shotOk && b64 !== undefined && b64 !== '') {
-          const ref = await attachments.saveImage({ data: Buffer.from(b64, 'base64'), mediaType: 'image/png', name: `window-${args.window_id}.png` })
-          const width = Number(state.screenshot_width ?? ref.width)
-          const height = Number(state.screenshot_height ?? ref.height)
-          value.screenshot = {
-            width,
-            height,
-            attachment: {
-              attachmentId: ref.attachmentId,
-              mediaType: ref.mediaType,
-              bytes: ref.bytes,
-              width: ref.width,
-              height: ref.height,
-              ...(ref.name === undefined ? {} : { name: ref.name }),
-              ...(ref.originalDimensions === undefined ? {} : { originalDimensions: { ...ref.originalDimensions } }),
-            },
+        return guard({ pid: args.pid }, exec, async (signal) => {
+          const wantShot = args.include_screenshot !== false
+          const attachments = wantShot ? ctx.get?.('attachments') : undefined
+          const shotOk = wantShot && attachments !== undefined && await modelTakesImages(ctx, { ...exec, signal })
+          /** @type {Record<string, unknown>} */
+          const request = { pid: args.pid, window_id: args.window_id, include_screenshot: shotOk }
+          if (shotOk) request.max_image_dimension = SHOT_EDGE
+          const query = typeof args.query === 'string' && args.query !== '' ? args.query : undefined
+          if (query !== undefined) request.query = query
+          // cua-driver 收 100～120000；超出范围先夹住，不让一次读树卡太久或报参数错
+          if (typeof args.timeout_ms === 'number') request.timeout_ms = Math.min(120_000, Math.max(100, args.timeout_ms))
+          // 树读得越久，命令行那边也要等得越久
+          const state = await forward('get_window_state', request, exec, 60_000 + (typeof request.timeout_ms === 'number' ? request.timeout_ms : 0), signal)
+          const snapshot = String(state.snapshot_id ?? '')
+          if (snapshot !== '') snapshots.set(snapKey(session, args.pid, args.window_id), snapshot)
+          let tree = String(state.tree_markdown ?? '')
+          let menuHidden = 0
+          // 用了 query 时树已经只剩匹配的行，菜单栏里的匹配项说明 Agent 正在找它，不去掉（空的 query 不算用了）
+          if (args.include_menu_bar !== true && query === undefined) {
+            const trimmed = withoutMenuBar(tree)
+            tree = trimmed.tree
+            menuHidden = trimmed.removed
           }
-        } else if (wantShot) {
-          value.screenshot_note = shotOk ? 'not available for this window (use the tree)' : 'skipped: the current model does not take images, or image storage is unavailable'
-        }
-        return value
+          if (tree.length > MAX_TREE_CHARS) tree = `${tree.slice(0, MAX_TREE_CHARS)}\n… (tree cut at ${MAX_TREE_CHARS} characters; use query to narrow it)`
+          /** @type {Record<string, unknown>} */
+          const value = {
+            pid: args.pid,
+            window_id: args.window_id,
+            app_name: String(state.app_name ?? ''),
+            window_title: String(state.window_title ?? ''),
+            snapshot_id: snapshot,
+            tree,
+            truncated: state.truncated === true,
+            ...(state.truncated === true && typeof state.truncation_reason === 'string' ? { truncation_reason: state.truncation_reason } : {}),
+            ...(menuHidden > 0 ? { menu_items_hidden: menuHidden } : {}),
+          }
+          const b64 = typeof state.screenshot_png_b64 === 'string' ? state.screenshot_png_b64 : undefined
+          if (shotOk && b64 !== undefined && b64 !== '') {
+            const ref = await attachments.saveImage({ data: Buffer.from(b64, 'base64'), mediaType: 'image/png', name: `window-${args.window_id}.png` })
+            const width = Number(state.screenshot_width ?? ref.width)
+            const height = Number(state.screenshot_height ?? ref.height)
+            value.screenshot = {
+              width,
+              height,
+              attachment: {
+                attachmentId: ref.attachmentId,
+                mediaType: ref.mediaType,
+                bytes: ref.bytes,
+                width: ref.width,
+                height: ref.height,
+                ...(ref.name === undefined ? {} : { name: ref.name }),
+                ...(ref.originalDimensions === undefined ? {} : { originalDimensions: { ...ref.originalDimensions } }),
+              },
+            }
+          } else if (wantShot) {
+            value.screenshot_note = shotOk ? 'not available for this window (use the tree)' : 'skipped: the current model does not take images, or image storage is unavailable'
+          }
+          return value
+        })
       },
     })
 
@@ -437,7 +451,8 @@ export function registerComputerTools(ctx, deps) {
           x: PX('X'),
           y: PX('Y'),
           button: { type: 'string', enum: ['left', 'right'], description: 'Default left.' },
-          count: { type: 'integer', description: 'Click count for x/y clicks, 2 for a double-click. Default 1.' },
+          count: { type: 'integer', description: 'Click count, 2 for a double-click. Default 1.' },
+          foreground: FOREGROUND,
         },
         required: ['pid', 'window_id'],
         additionalProperties: false,
@@ -446,9 +461,25 @@ export function registerComputerTools(ctx, deps) {
       async execute(/** @type {any} */ args, /** @type {any} */ exec) {
         const session = sessionOf(exec)
         const request = targetArgs(args, session, true)
-        if (args.button === 'right') request.button = 'right'
-        if (typeof args.count === 'number' && request.x !== undefined) request.count = args.count
-        const result = await forward('click', request, exec)
+        const count = typeof args.count === 'number' ? args.count : 1
+        if (count < 1 || count > 3) throw new Error('Invalid arguments for computer_click: "count" must be 1, 2, or 3.')
+        // 按元素双击：cua-driver 的 click 会忽略 element_index 上的 count，改走 double_click（优先 AXOpen，没有就点元素中心两次）
+        const useDoubleClick = request.element_index !== undefined && count > 1
+        if (useDoubleClick) {
+          if (count !== 2) throw new Error('computer_click: triple-click requires x and y coordinates.')
+          if (args.button === 'right') throw new Error('computer_click: double-click on element_index supports only the left button.')
+        } else {
+          if (args.button === 'right') request.button = 'right'
+          if (typeof args.count === 'number' && request.x !== undefined) request.count = args.count
+        }
+        const fg = args.foreground === true
+        if (fg) request.delivery_mode = 'foreground'
+        const toolName = useDoubleClick ? 'double_click' : 'click'
+        const result = await guard({ pid: args.pid }, exec, signal =>
+          fg
+            ? withFg(session, args.pid, signal, () => forward(toolName, request, exec, undefined, signal))
+            : forward(toolName, request, exec, undefined, signal),
+        )
         // 面板据此出一圈点击涟漪（比轮询光标动画状态猜准）
         onClick?.(session)
         return result
@@ -468,6 +499,7 @@ export function registerComputerTools(ctx, deps) {
           snapshot_id: SNAPSHOT_ID,
           x: FOCUS_X,
           y: FOCUS_Y,
+          foreground: FOREGROUND_REF,
         },
         required: ['pid', 'window_id', 'text'],
         additionalProperties: false,
@@ -477,7 +509,13 @@ export function registerComputerTools(ctx, deps) {
         const session = sessionOf(exec)
         // x/y：cua-driver 先在这一点点一下聚焦再输入（网页、Electron 输入框按元素后台输入会被拒）
         const request = targetArgs(args, session, false)
-        return forward('type_text', { ...request, text: args.text }, exec)
+        const fg = args.foreground === true
+        const payload = { ...request, text: args.text, ...(fg ? { delivery_mode: 'foreground' } : {}) }
+        return guard({ pid: args.pid }, exec, signal =>
+          fg
+            ? withFg(session, args.pid, signal, () => forward('type_text', payload, exec, undefined, signal))
+            : forward('type_text', payload, exec, undefined, signal),
+        )
       },
     })
 
@@ -495,6 +533,7 @@ export function registerComputerTools(ctx, deps) {
           snapshot_id: SNAPSHOT_ID,
           x: FOCUS_X,
           y: FOCUS_Y,
+          foreground: FOREGROUND_REF,
         },
         required: ['pid', 'window_id', 'key'],
         additionalProperties: false,
@@ -503,7 +542,18 @@ export function registerComputerTools(ctx, deps) {
       async execute(/** @type {any} */ args, /** @type {any} */ exec) {
         const session = sessionOf(exec)
         const request = targetArgs(args, session, false)
-        return forward('press_key', { ...request, key: args.key, ...(Array.isArray(args.modifiers) && args.modifiers.length > 0 ? { modifiers: args.modifiers } : {}) }, exec)
+        const fg = args.foreground === true
+        const payload = {
+          ...request,
+          key: args.key,
+          ...(Array.isArray(args.modifiers) && args.modifiers.length > 0 ? { modifiers: args.modifiers } : {}),
+          ...(fg ? { delivery_mode: 'foreground' } : {}),
+        }
+        return guard({ pid: args.pid }, exec, signal =>
+          fg
+            ? withFg(session, args.pid, signal, () => forward('press_key', payload, exec, undefined, signal))
+            : forward('press_key', payload, exec, undefined, signal),
+        )
       },
     })
 
@@ -521,6 +571,7 @@ export function registerComputerTools(ctx, deps) {
           snapshot_id: SNAPSHOT_ID,
           x: PX('X'),
           y: PX('Y'),
+          foreground: FOREGROUND_REF,
         },
         required: ['pid', 'window_id', 'direction'],
         additionalProperties: false,
@@ -529,7 +580,18 @@ export function registerComputerTools(ctx, deps) {
       async execute(/** @type {any} */ args, /** @type {any} */ exec) {
         const session = sessionOf(exec)
         const request = targetArgs(args, session, false)
-        return forward('scroll', { ...request, direction: args.direction, amount: typeof args.amount === 'number' ? args.amount : 3 }, exec)
+        const fg = args.foreground === true
+        const payload = {
+          ...request,
+          direction: args.direction,
+          amount: typeof args.amount === 'number' ? args.amount : 3,
+          ...(fg ? { delivery_mode: 'foreground' } : {}),
+        }
+        return guard({ pid: args.pid }, exec, signal =>
+          fg
+            ? withFg(session, args.pid, signal, () => forward('scroll', payload, exec, undefined, signal))
+            : forward('scroll', payload, exec, undefined, signal),
+        )
       },
     })
   })

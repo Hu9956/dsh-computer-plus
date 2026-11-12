@@ -16,7 +16,14 @@ import { join } from 'node:path'
 /** cua-driver 的位置：GUI 应用的 PATH 往往不含 ~/.local/bin，按官方安装位置挨个找 */
 export async function findCuaDriver() {
   const home = process.env.HOME ?? ''
-  for (const file of [join(home, '.local/bin/cua-driver'), '/opt/homebrew/bin/cua-driver', '/usr/local/bin/cua-driver']) {
+  const candidates = [
+    join(home, '.local/bin/cua-driver'),
+    '/opt/homebrew/bin/cua-driver',
+    '/usr/local/bin/cua-driver',
+    '/Applications/CuaDriver.app/Contents/MacOS/cua-driver',
+    join(home, 'Applications/CuaDriver.app/Contents/MacOS/cua-driver'),
+  ]
+  for (const file of candidates) {
     if (await stat(file).then(info => info.isFile(), () => false)) return file
   }
   return undefined
@@ -94,7 +101,16 @@ export function parseResult(tool, result) {
 export function createDriver(options = {}) {
   /** @type {Promise<string | undefined> | undefined} */
   let found
-  const path = options.path ?? (() => (found ??= findCuaDriver()))
+  const path = options.path ?? (() => {
+    found ??= findCuaDriver().then((res) => {
+      if (res === undefined) found = undefined
+      return res
+    }, () => {
+      found = undefined
+      return undefined
+    })
+    return found
+  })
   /** 本进程里结束过的 session 名：下次用之前先 start_session */
   const ended = new Set()
   /** 本进程里用过、还没结束的 session 名（回合结束时只结束这些） */
@@ -195,6 +211,8 @@ export function createDriver(options = {}) {
     },
     /** 有没有 cua-driver（面板据此提示「没有找到 cua-driver」） */
     available: async () => (await path()) !== undefined,
+    /** 解析出的 cua-driver 路径（设置页体检用） */
+    path,
   }
 }
 

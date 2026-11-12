@@ -1,38 +1,59 @@
-# 电脑操控 Plus（dsh-computer-plus）
+# @kewen/dsh-computer-plus · 电脑操控 Plus
 
-给 DSH 的 Agent 一组 `computer_*` 工具来操控 macOS 应用，并在对话信息面板的「电脑操控」组里实时显示它正在操控的窗口。
+给 DeepSeek Harness（DSH）提供精简高效的 macOS 桌面应用操控能力，并在对话信息面板中实时显示正在操控的窗口画面（仅支持 macOS）。
 
-- 底层是 [cua-driver](https://cua.ai/docs/cua-driver)：插件调 `cua-driver call <工具> <JSON>`，和在终端里用的是同一个守护进程、同一套权限。只走后台投递，不抢前台、不动你的鼠标。
-- 面板只看 Agent 调工具时写明的 `pid` 和 `window_id`，不解析 bash 命令、不猜窗口。Agent 在 bash 里直接调 cua-driver 时面板不显示。
-- 截图交给模型时存成附件（和 `read_image` 一样）；面板画面只在内存里留最新一帧，不落盘、不进会话日志，重启即无。
+- **全模式可用 & 极省上下文**：仅注册 7 个精简 `computer_*` 工具（普通模式与 PTC 模式均可直接调用），默认裁掉冗长的应用菜单栏树，避免反复烧上下文。
+- **默认后台静默 + 前台状态胶囊兜底**：底层基于 [cua-driver](https://cua.ai/docs/cua-driver)，日常操作在后台投递，不抢焦点、不移动真实鼠标；仅在后台失效显式走 `foreground: true` 前台兜底时，屏幕顶部提前 `0.8 秒` 亮起非抢焦胶囊（「即将借用前台」→「正在使用中」），结束后自动归还你原本的前台窗口并绿灯提示「使用完毕」。
+- **逐应用访问授权与随时撤销**：首次启动或操控某个应用前弹出官方审批卡片（「仅本次会话允许 / 始终允许 / 拒绝」），可在插件详情页随时撤销（立即中止正在进行的操控）。
+- **开箱即用免编译**：内置 `arm64 + x86_64` 预编译通用二进制取流组件，无需安装 Xcode 命令行工具，插件详情页支持一键安装 `cua-driver` 与引导授权系统权限。
 
-## 工具
+---
+
+## 安装与准备
+
+### 1. 安装插件
+
+在 DSH 侧栏打开「插件」→「添加插件」，输入仓库地址即可安装并启用：
+
+```text
+https://github.com/Hu9956/dsh-computer-plus
+```
+
+也可以从 [Releases](https://github.com/Hu9956/dsh-computer-plus/releases/latest) 下载最新的 `.tgz` 安装包，在「添加插件」时填入本地文件路径。
+
+> **使用建议**：请与 DSH 官方实验性插件 **「Computer Use」** 二选一开启，避免在 PTC 模式下同时注入两套电脑操控指令造成双倍 Token 消耗，或因模型误走官方通道导致无实时画面与顶部状态胶囊。
+
+### 2. 环境与权限（插件详情页一键引导）
+
+安装启用后，点进「插件」→「电脑操控 Plus」详情页即可完成全部准备：
+
+| 项目 | 作用 | 准备方式 |
+| --- | --- | --- |
+| **底层驱动 `cua-driver`** | 后台读取无障碍控件树、窗口截图与注入点击输入 | 详情页点击 **「一键安装」**（或复制命令在终端执行） |
+| **辅助功能 + 屏幕录制（`CuaDriver`）** | 允许驱动在后台读取控件、点击输入及截取目标窗口供模型观察 | 详情页点击 **「申请权限」** 并在系统设置中开启开关 |
+| **屏幕录制（`DeepSeek Harness`）** | 在对话信息面板实时显示 10fps 操控画面（需配合 `dsh-harness-plus` 面板插槽；未装面板时工具照常可用） | 详情页点击 **「申请权限」** 并在系统设置中开启开关 |
+
+---
+
+## 工具列表
 
 | 工具 | 作用 |
 | --- | --- |
-| `computer_launch_app` | 在后台打开（或找到）应用，返回 pid；窗口已就绪时一并给出 window_id |
-| `computer_list_windows` | 列出窗口的 pid、window_id |
-| `computer_get_window_state` | 读一个窗口的界面树（可操作元素编号 [N]）和截图；默认去掉应用菜单栏 |
-| `computer_click` | 按元素编号或截图像素点击 |
-| `computer_type_text` | 输入文字（网页、Electron 的输入框可传 x/y，先在那里点一下再输入） |
-| `computer_press_key` | 按键 / 快捷键（同样可传 x/y） |
-| `computer_scroll` | 滚动 |
+| `computer_launch_app` | 在后台打开（或找到）应用，返回 `pid`；窗口已就绪时一并给出 `window_id` |
+| `computer_list_windows` | 列出运行中窗口的 `pid`、`window_id` 与尺寸位置 |
+| `computer_get_window_state` | 读取窗口界面树（可操作元素编号 `[N]`）和截图；默认隐藏顶层应用菜单栏 |
+| `computer_click` | 按元素编号或截图像素单击 / 双击（`count: 2`），支持 `foreground: true` 前台兜底 |
+| `computer_type_text` | 输入文字（网页/Electron 输入框可传 `x/y` 先点击聚焦再输入） |
+| `computer_press_key` | 按键或快捷键（如 `cmd+a`），同样支持传 `x/y` |
+| `computer_scroll` | 滚动窗口或指定坐标区域 |
 
-参数先按 schema 校验，不合格直接报错给 Agent，不带着错的值去操作。菜单命令、拖动、需要窗口在前台的操作不在这组工具里，Agent 用 bash 调 cua-driver（面板不显示这些步骤）。
+> **隐私与安全**：面板画面仅在内存中保留最新一帧（单会话封顶，过期自动清理），不落盘、不写入会话日志；`/computer-plus/*` 全部路由复用宿主鉴权且仅允许本机 `owner` 访问；应用授权文件以 `0600` 权限原子保存在 `~/.dsh/computer-plus/permissions.json`。
 
-每个 DSH 对话用一个固定的 cua-driver session（`dsh-` + 对话 id 的哈希），回合结束时插件结束它，下一轮自动重新开始。回合结束时 CuaDriver 没在运行就不去启动它。
+---
 
-面板路由 `/computer-plus/*` 用和 `/api` 同一套登录校验，并且只给本机主人看。
-
-## 依赖
-
-- macOS，装好 cua-driver（`~/.local/bin`、`/opt/homebrew/bin` 或 `/usr/local/bin`），并授予辅助功能和屏幕录制权限
-- 实时画面要 Xcode 命令行工具（首次用到时用 `swiftc` 编译 `assets/computer-stream.swift`，产物在 `~/Library/Caches/dsh-computer-plus`）。没装就不编，不会弹系统的安装对话框，只是没有画面
-- 面板来自 dsh-harness-plus 的对话信息面板，它声明插槽 `harness.session-info.computer`；没装它时工具照常能用，只是没有画面
-
-## 开发
+## 本地开发
 
 ```bash
-npm test          # 单元测试
-node run.mjs bundle   # 类型检查 + 打包到 lib/
+npm test              # 运行全部单元测试
+node run.mjs bundle   # TypeScript 类型检查 + 打包客户端与服务端产物到 lib/
 ```

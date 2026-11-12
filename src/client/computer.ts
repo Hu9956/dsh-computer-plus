@@ -101,7 +101,7 @@ export function screenNote(target: ComputerTarget | undefined, frame: ComputerFr
   if (frame.error === 'capture-failed') return '截不到画面，请在系统设置里给 DeepSeek Harness 打开屏幕录制权限'
   if (target === undefined) return 'Agent 操控电脑时，画面显示在这里'
   if (!target.active) return '本轮没有留下画面'
-  if (preparing) return '首次使用，正在准备画面（约 10 秒）'
+  if (preparing) return '正在准备画面组件…'
   return '正在获取画面…'
 }
 

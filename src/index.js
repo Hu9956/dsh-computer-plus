@@ -1,12 +1,16 @@
 import { execFile, spawn } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
-import { mkdir, readFile, rename, stat, unlink } from 'node:fs/promises'
+import { constants } from 'node:fs'
+import { access as fsAccess, chmod, mkdir, readFile, rename, stat, unlink } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+import { createAppAccess } from './access.js'
 import { createDriver } from './driver.js'
+import { createForegroundHud } from './hud.js'
 import { COMPUTER_PROJECTION, computerProjection } from './projection.js'
+import { createSetupManager } from './setup.js'
 import { registerComputerTools } from './tools.js'
 
 /**
@@ -39,6 +43,7 @@ const MJPEG_MAX_BUFFERED = 1024 * 1024
 /** 光标：客户端多久没来问就停止轮询 cua-driver */
 const CURSOR_IDLE_MS = 2000
 const CURSOR_POLL_MS = 250
+const STREAM_PREBUILT = new URL('../assets/computer-stream', import.meta.url)
 const STREAM_SOURCE = new URL('../assets/computer-stream.swift', import.meta.url)
 /** 辅助程序退出码 → 面板上的原因。4 = 取不到画面（多半没有屏幕录制权限）；5 = 取流中途停了（锁屏、在系统的录屏指示里点了停止），不是权限问题 */
 const STREAM_EXIT = /** @type {Record<number, string>} */ ({ 3: 'window-gone', 4: 'capture-failed', 5: 'capture-stopped' })
@@ -136,7 +141,62 @@ export function splitCorners(frame) {
 }
 
 /**
- * 编译取流辅助程序（只在 macOS、只编一次，产物按源码哈希命名）。没有 swiftc 或编译失败返回 undefined
+ * 优先用随包附带的预编译通用二进制（arm64 + x86_64），用户无需安装 Xcode 命令行工具。
+ * 若包解压后丢失了执行权限位，尝试补一次 0o755；仍不可执行才回退到 swiftc 编译。
+ * @param {string} [candidate]
+ */
+export async function resolvePrebuiltHelper(candidate = fileURLToPath(STREAM_PREBUILT)) {
+  if (process.platform !== 'darwin') return undefined
+  if (!await stat(candidate).then(info => info.isFile(), () => false)) return undefined
+  if (await fsAccess(candidate, constants.X_OK).then(() => true, () => false)) return candidate
+  await chmod(candidate, 0o755).catch(() => {})
+  return await fsAccess(candidate, constants.X_OK).then(() => candidate, () => undefined)
+}
+
+/**
+ * 读取管理接口的 JSON 请求体（限制 16KB，且要求 Content-Type 为 application/json 防跨站表单提交）
+ * @param {import('node:http').IncomingMessage} req
+ * @returns {Promise<Record<string, any> | null>}
+ */
+function readJsonBody(req) {
+  const type = String(req.headers['content-type'] ?? '').toLowerCase()
+  if (!type.includes('application/json')) return Promise.resolve(null)
+  return new Promise((done) => {
+    /** @type {Buffer[]} */
+    const chunks = []
+    let size = 0
+    let failed = false
+    req.on('data', (/** @type {Buffer} */ chunk) => {
+      if (failed) return
+      size += chunk.length
+      if (size > 16_384) {
+        failed = true
+        done(null)
+        return
+      }
+      chunks.push(chunk)
+    })
+    req.on('end', () => {
+      if (failed) return
+      try {
+        const text = Buffer.concat(chunks, size).toString('utf8')
+        const parsed = text.trim() === '' ? {} : JSON.parse(text)
+        done(parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null)
+      } catch {
+        done(null)
+      }
+    })
+    req.on('error', () => {
+      if (!failed) {
+        failed = true
+        done(null)
+      }
+    })
+  })
+}
+
+/**
+ * 编译取流辅助程序（只在预编译程序缺失或无法运行时兜底，产物按源码哈希命名）。没有 swiftc 或编译失败返回 undefined
  * @param {any} logger
  */
 async function buildHelper(logger) {
@@ -239,11 +299,16 @@ export async function apply(ctx) {
 
   /** @type {Promise<string | undefined> | undefined} */
   let helperPath
+  let prebuiltBroken = false
   let helperFailedAt = 0
   let helperBuilding = false
   const helper = () => {
     if (helperPath === undefined && Date.now() - helperFailedAt < HELPER_RETRY_MS) return Promise.resolve(undefined)
     return (helperPath ??= (async () => {
+      if (!prebuiltBroken) {
+        const prebuilt = await resolvePrebuiltHelper()
+        if (prebuilt !== undefined) return prebuilt
+      }
       const slow = setTimeout(() => { helperBuilding = true }, 300)
       try {
         const built = await buildHelper(ctx.logger)
@@ -258,8 +323,14 @@ export async function apply(ctx) {
       }
     })())
   }
-  /** 起不来（缓存里的程序被删了、没有执行权限）：下次重新找、重新编 */
-  const forgetHelper = () => { helperPath = undefined }
+  /** 起不来（预编译程序损坏、缓存里的程序被删了、没有执行权限）：下次跳过坏掉的那份重新找、重新编 */
+  const forgetHelper = () => {
+    const failed = helperPath
+    helperPath = undefined
+    failed?.then((resolved) => {
+      if (resolved === fileURLToPath(STREAM_PREBUILT)) prebuiltBroken = true
+    }, () => {})
+  }
 
   /**
    * 辅助程序退出码记到这一条上。3（窗口没了）、5（中途停了）：这一步不再起，Agent 下一步再试；
@@ -324,9 +395,15 @@ export async function apply(ctx) {
     }
   }
 
+  const access = createAppAccess(ctx, { helper, driver })
+  const setup = createSetupManager({ driver, helper })
+  const hud = createForegroundHud({ helper })
+
   const tools = registerComputerTools(ctx, {
     driver,
     labelOf,
+    withAppAccess: access.withAppAccess,
+    runForeground: hud.runForeground,
     onClick: (sessionId) => {
       const entry = entries.get(sessionId)
       if (entry !== undefined) entry.clicks++
@@ -344,6 +421,7 @@ export async function apply(ctx) {
       if (current !== undefined) stopStream(current)
       entries.delete(id)
       tools.forget(id)
+      hud.finishSession(id, 'aborted')
       return
     }
     const now = Date.now()
@@ -365,8 +443,11 @@ export async function apply(ctx) {
       entry = { target, touchedAt: now, clicks: current?.clicks ?? 0 }
       entries.set(id, entry)
     }
-    // 回合结束：结束这个对话的 cua-driver session（虚拟光标随之消失）。下一轮第一次调用时插件会重新 start_session
-    if (!target.active && wasActive) driver.endSession(labelOf(id)).catch(() => {})
+    // 回合结束：结束这个对话的 cua-driver session（虚拟光标随之消失），并让前台状态胶囊收尾归还焦点
+    if (!target.active && wasActive) {
+      driver.endSession(labelOf(id)).catch(() => {})
+      hud.finishSession(id, target.ended)
+    }
     // 这一轮结束、而且没人在看：补拍一帧当冻结画面，面板之后打开也有东西可看。
     // 2026-11-02 真机：一轮只有 4 秒，面板没开着，取流从没启动，结束后显示「本轮没有留下画面」。
     // 只在结束时拍一次，不每步都拍：每次拍菜单栏都会闪一下录屏图标；面板开着时取流本来就在更新画面
@@ -558,7 +639,7 @@ export async function apply(ctx) {
   const sweeper = setInterval(() => evict(Date.now()), EVICT_EVERY_MS)
   sweeper.unref?.()
 
-  ctx.effect(() => () => {
+  ctx.effect(() => async () => {
     disposed = true
     clearInterval(sweeper)
     for (const entry of entries.values()) stopStream(entry)
@@ -566,6 +647,8 @@ export async function apply(ctx) {
     // 补拍中的辅助程序也停掉（原来要等 4 秒超时才停）
     for (const proc of snapshotProcs) killHelper(proc)
     snapshotProcs.clear()
+    hud.dispose()
+    await access.dispose()
   }, 'computer-plus: frames')
 
   ctx.inject(['systemPrompt'], (/** @type {any} */ scope) => {
@@ -578,6 +661,8 @@ export async function apply(ctx) {
    * GET /computer-plus/frame?session=<id>   → 最新一帧（image/jpeg，ETag）
    * GET /computer-plus/status?session=<id>  → { point, clicks, preparing }（客户端看着时每 250ms 问一次）
    * GET /computer-plus/icon?session=<id>    → 当前操控应用的图标
+   * GET/POST /computer-plus/setup           → 驱动安装状态与系统权限自检、引导（仅 owner）
+   * GET/POST /computer-plus/permissions     → 逐应用授权列表、撤销与允许再次询问（仅 owner）
    * 页面只能给 sessionId，不能指定窗口：目标完全由 Agent 的工具调用决定。没有目标 → 204
    */
   ctx.inject(['webServer'], (/** @type {any} */ scope) => {
@@ -593,6 +678,74 @@ export async function apply(ctx) {
         }
         const url = new URL(req.url ?? '/', 'http://x')
         const route = url.pathname.slice(COMPUTER_PATH.length)
+
+        if (route === '/setup') {
+          if (req.method === 'GET') {
+            sendJson(res, 200, await setup.status())
+            return
+          }
+          if (req.method === 'POST') {
+            const body = await readJsonBody(req)
+            if (body === null || typeof body.action !== 'string') {
+              sendJson(res, 400, { error: 'invalid request body' })
+              return
+            }
+            try {
+              if (body.action === 'install-driver') {
+                sendJson(res, 200, await setup.installDriver())
+                return
+              }
+              if (body.action === 'request-permission' && (body.target === 'driver-accessibility' || body.target === 'driver-screen' || body.target === 'host-screen')) {
+                sendJson(res, 200, await setup.requestPermission(body.target))
+                return
+              }
+              if (body.action === 'open-settings' && (body.pane === 'accessibility' || body.pane === 'screenRecording')) {
+                await setup.openSettings(body.pane)
+                sendJson(res, 200, await setup.status())
+                return
+              }
+              sendJson(res, 400, { error: 'unknown setup action' })
+            } catch (error) {
+              sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) })
+            }
+            return
+          }
+          sendJson(res, 405, { error: 'method not allowed' })
+          return
+        }
+
+        if (route === '/permissions') {
+          if (req.method === 'GET') {
+            sendJson(res, 200, await access.status())
+            return
+          }
+          if (req.method === 'POST') {
+            const body = await readJsonBody(req)
+            if (body === null || typeof body.action !== 'string' || typeof body.id !== 'string') {
+              sendJson(res, 400, { error: 'invalid request body' })
+              return
+            }
+            try {
+              if (body.action === 'revoke') {
+                await access.revoke(body.id)
+                sendJson(res, 200, await access.status())
+                return
+              }
+              if (body.action === 'retry') {
+                await access.retryApproval(body.id)
+                sendJson(res, 200, await access.status())
+                return
+              }
+              sendJson(res, 400, { error: 'unknown permission action' })
+            } catch (error) {
+              sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) })
+            }
+            return
+          }
+          sendJson(res, 405, { error: 'method not allowed' })
+          return
+        }
+
         if (!['/frame', '/stream', '/status', '/icon'].includes(route) || req.method !== 'GET') {
           sendJson(res, 404, { error: 'not found' })
           return

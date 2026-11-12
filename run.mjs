@@ -18,7 +18,7 @@ for (const [tool, ...args] of commands[mode]) {
 }
 if (mode === 'bundle') {
   mkdirSync(resolve(here, 'lib'), { recursive: true })
-  for (const file of ['index.js', 'driver.js', 'projection.js', 'tools.js']) copyFileSync(resolve(here, 'src', file), resolve(here, 'lib', file))
+  for (const file of ['index.js', 'driver.js', 'projection.js', 'tools.js', 'access.js', 'setup.js', 'hud.js']) copyFileSync(resolve(here, 'src', file), resolve(here, 'lib', file))
   const { name } = JSON.parse(readFileSync(resolve(here, 'package.json'), 'utf8'))
   const registrations = []
   runInNewContext(readFileSync(resolve(here, 'lib/client.js'), 'utf8'), {

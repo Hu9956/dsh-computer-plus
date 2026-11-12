@@ -1,5 +1,4 @@
 node_modules/
-lib/
 preview/dist/
 *.tgz
 .DS_Store
