@@ -1,6 +1,6 @@
 {
   "name": "@kewen/dsh-computer-plus",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "repository": {
     "type": "git",
     "url": "https://github.com/Hu9956/dsh-computer-plus.git"
@@ -9,7 +9,7 @@
   "bugs": {
     "url": "https://github.com/Hu9956/dsh-computer-plus/issues"
   },
-  "description": "电脑操控 Plus：给 Agent 一组 computer_* 工具（底层是 cua-driver），在对话信息面板里实时显示它正在操控的窗口。仅 macOS。",
+  "description": "让 Agent 在后台操控 macOS 桌面应用，不抢鼠标与窗口焦点；支持逐应用安全授权、前台借用胶囊提醒与一键引导配置（仅 macOS）。",
   "icon": "./icon.svg",
   "type": "module",
   "main": "lib/index.js",
@@ -22,7 +22,7 @@
   "dsh": {
     "meta": {
       "title": "电脑操控 Plus",
-      "description": "给 Agent 一组 computer_* 工具（底层是 cua-driver），在对话信息面板里实时显示它正在操控的窗口。仅 macOS。"
+      "description": "让 Agent 在后台操控 macOS 桌面应用，不抢鼠标与窗口焦点；支持逐应用安全授权、前台借用胶囊提醒与一键引导配置（仅 macOS）。"
     },
     "bundle": {
       "patch": "./cordis.patch.yml"
