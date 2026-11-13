@@ -1,9 +1,10 @@
 import { useState } from 'react'
+import { StateDot } from '@kewen/dsh-ui'
 import { ComputerScreen } from './ComputerScreen'
-import { COMPUTER_PROJECTION, appIconUrl, appName, appStatus, asComputerTarget } from './computer'
+import { COMPUTER_PROJECTION, appIconUrl, appName, appStatus, asComputerTarget, statusDotState } from './computer'
 
 /**
- * 对话信息面板「电脑操控」组的内容：应用行（图标 + 名字 + 状态）和画面。
+ * 对话信息面板「电脑操控」组的内容：应用行（图标 + 名字 + 状态圆点）和画面。
  * 组的外框（组名、收起箭头）归面板所有（dsh-harness-plus 的 SessionInfo），它声明插槽 COMPUTER_SLOT、
  * 渲染时传进 sessionId、enabled（面板开着且这一组没收起）和 useProjection。
  */
@@ -30,7 +31,12 @@ export function ComputerGroup({ sessionId, enabled, useProjection }: ComputerGro
             : <MonitorIcon />}
         </span>
         <span className="hs-info-text cp-app-name" title={name}>{name}</span>
-        <span className="hs-info-note cp-app-status" data-active={target?.active === true || undefined}>{appStatus(target)}</span>
+        <StateDot
+          state={statusDotState(target)}
+          label={appStatus(target)}
+          className="hs-info-note cp-app-status"
+          data-active={target?.active === true || undefined}
+        />
       </div>
       <ComputerScreen sessionId={sessionId} target={target} enabled={enabled} />
     </>
@@ -39,9 +45,9 @@ export function ComputerGroup({ sessionId, enabled, useProjection }: ComputerGro
 
 function MonitorIcon() {
   return (
-    <svg className="cp-ic" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-      <rect x="3.5" y="4.5" width="17" height="12" rx="2.5" />
-      <path d="M9 20h6M12 16.5V20" />
+    <svg className="cp-ic" viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+      <rect x="2" y="2.75" width="12" height="8.5" rx="1.75" />
+      <path d="M5.75 13.5h4.5M8 11.25v2.25" />
     </svg>
   )
 }

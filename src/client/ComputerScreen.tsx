@@ -1,5 +1,6 @@
-import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
+import { CheckIcon, CloseIcon, IconButton, isImeComposing } from '@kewen/dsh-ui'
 import {
   appName,
   contentRect,
@@ -9,6 +10,7 @@ import {
   useBoxSize,
   useComputerFrame,
   useComputerStatus,
+  useCursorOverlay,
   type ComputerStatus,
   type ComputerTarget,
   type Corners,
@@ -25,6 +27,7 @@ export function ComputerScreen({ sessionId, target, enabled }: {
   enabled: boolean
 }) {
   const [zoomed, setZoomed] = useState(false)
+  const showCursor = useCursorOverlay()
   const status = useComputerStatus(sessionId, target, enabled)
   const frame = useComputerFrame(sessionId, target, enabled, zoomed)
   const showing = frame.url !== undefined && frame.error === undefined
@@ -40,10 +43,31 @@ export function ComputerScreen({ sessionId, target, enabled }: {
   const corners = active ? status.corners : frame.corners ?? status.corners
   return (
     <>
-      <Frame className="cp-screen" url={frame.url!} label={label} active={active} done={done} status={status} corners={corners} onError={frame.onError} onOpen={() => setZoomed(true)} />
+      <Frame
+        className="cp-screen"
+        url={frame.url!}
+        label={label}
+        active={active}
+        done={done}
+        showCursor={showCursor}
+        status={status}
+        corners={corners}
+        onError={frame.onError}
+        onOpen={() => setZoomed(true)}
+      />
       {zoomed && createPortal(
         <ZoomView label={label} onClose={() => setZoomed(false)}>
-          <Frame className="cp-zoom-frame" url={frame.url!} label={label} active={active} done={done} status={status} corners={corners} onError={frame.onError} />
+          <Frame
+            className="cp-zoom-frame"
+            url={frame.url!}
+            label={label}
+            active={active}
+            done={done}
+            showCursor={showCursor}
+            status={status}
+            corners={corners}
+            onError={frame.onError}
+          />
         </ZoomView>,
         document.body,
       )}
@@ -52,12 +76,13 @@ export function ComputerScreen({ sessionId, target, enabled }: {
 }
 
 /** 一块画面：图片 + 按实际区域摆的光标。onOpen 有值时整块可点（面板里那块），放大里那块不可点 */
-function Frame({ className, url, label, active, done, status, corners, onError, onOpen }: {
+function Frame({ className, url, label, active, done, showCursor, status, corners, onError, onOpen }: {
   className: string
   url: string
   label: string
   active: boolean
   done: boolean
+  showCursor: boolean
   status: ComputerStatus
   corners: Corners | undefined
   onError: () => void
@@ -84,7 +109,8 @@ function Frame({ className, url, label, active, done, status, corners, onError, 
         'aria-label': `放大查看${label}`,
         title: '点击放大查看',
         onClick: onOpen,
-        onKeyDown: (event: React.KeyboardEvent) => {
+        onKeyDown: (event: ReactKeyboardEvent) => {
+          if (isImeComposing(event)) return
           if (event.key !== 'Enter' && event.key !== ' ') return
           event.preventDefault()
           onOpen()
@@ -107,10 +133,10 @@ function Frame({ className, url, label, active, done, status, corners, onError, 
       {/* 完成徽标贴外框右下角：竖窗口（计算器）两边有留白，徽标落在留白里，不盖住应用的按钮 */}
       {done && (
         <span className="cp-done" role="img" aria-label="已完成">
-          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5.6 10.4l2.9 2.9 5.9-6.2" /></svg>
+          <CheckIcon size={13} inline={false} />
         </span>
       )}
-      {area !== undefined && status.point !== null && active && (
+      {showCursor && area !== undefined && status.point !== null && active && (
         <span
           className="cp-cursor"
           aria-hidden="true"
@@ -140,7 +166,7 @@ function ZoomView({ label, onClose, children }: { label: string, onClose: () => 
     const previous = document.activeElement as HTMLElement | null
     close.current?.focus()
     const onKey = (event: KeyboardEvent) => {
-      if (event.key !== 'Escape') return
+      if (event.key !== 'Escape' || isImeComposing(event)) return
       event.preventDefault()
       event.stopPropagation()
       closeRef.current()
@@ -160,9 +186,9 @@ function ZoomView({ label, onClose, children }: { label: string, onClose: () => 
       onClick={(event) => { if (event.target === event.currentTarget) onClose() }}
     >
       {children}
-      <button ref={close} type="button" className="cp-zoom-close" aria-label="关闭放大" onClick={onClose}>
-        <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" /></svg>
-      </button>
+      <IconButton ref={close} size="md" className="cp-zoom-close" aria-label="关闭放大" onClick={onClose}>
+        <CloseIcon size={16} inline={false} />
+      </IconButton>
     </div>
   )
 }

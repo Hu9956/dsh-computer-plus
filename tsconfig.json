@@ -10,7 +10,12 @@
     "noEmit": true,
     "allowImportingTsExtensions": true,
     "esModuleInterop": true,
-    "allowJs": true
+    "allowJs": true,
+    "baseUrl": ".",
+    "paths": {
+      "@kewen/dsh-ui": ["../packages/dsh-ui/src/index.ts"],
+      "@kewen/dsh-ui/*": ["../packages/dsh-ui/src/*"]
+    }
   },
   "include": ["src", "tests"]
 }

@@ -1,5 +1,6 @@
 import { createElement, useSyncExternalStore } from 'react'
 import type { Context } from '@deepseek-ai/cordis'
+import { injectPluginStyles, mountDshUiStyles } from '@kewen/dsh-ui'
 import { COMPUTER_SLOT, ComputerGroup } from './ComputerGroup'
 import { AppApproval, selectAppApproval, type MatchedAppApproval } from './AppApproval'
 import { SettingsPanel } from './SettingsPanel'
@@ -33,7 +34,7 @@ type LocaleApi = {
 
 export const inject = ['slots']
 
-const PLUGIN_ID = '@kewen/dsh-computer-plus'
+export const PLUGIN_ID = '@kewen/dsh-computer-plus'
 const noopSubscribe = () => () => {}
 
 function useHostLang(ctx: Context): 'zh' | 'en' | undefined {
@@ -49,17 +50,19 @@ function useHostLang(ctx: Context): 'zh' | 'en' | undefined {
   return undefined
 }
 
-function injectStyles(): () => void {
-  if (typeof document === 'undefined') return () => {}
-  let style = document.querySelector<HTMLStyleElement>(`style[data-plugin-css="${PLUGIN_ID}"]`)
-  if (style === null) {
-    style = document.createElement('style')
-    style.dataset.pluginCss = PLUGIN_ID
-    document.head.appendChild(style)
+/**
+ * 挂载 @kewen/dsh-ui 共享样式块（引用计数 + 版本仲裁）与本插件私有样式，返回幂等卸载清理函数。
+ */
+export function injectStyles(): () => void {
+  const disposeUi = mountDshUiStyles()
+  const disposePlugin = injectPluginStyles(PLUGIN_ID, computerCss)
+  let disposed = false
+  return () => {
+    if (disposed) return
+    disposed = true
+    disposePlugin()
+    disposeUi()
   }
-  style.textContent = computerCss
-  const owned = style
-  return () => owned.remove()
 }
 
 export function apply(ctx: Context): void {

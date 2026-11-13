@@ -1,5 +1,18 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { BASE } from './computer'
+import {
+  Badge,
+  Banner,
+  Button,
+  Card,
+  CardRow,
+  CheckIcon,
+  EmptyState,
+  LoadingState,
+  Modal,
+  StandaloneSwitch,
+  StateDot,
+} from '@kewen/dsh-ui'
+import { BASE, setCursorOverlay, useCursorOverlay } from './computer'
 
 export interface SetupState {
   platform: string
@@ -60,16 +73,25 @@ const COPY = {
     hostScreenTitle: '屏幕录制（面板实时画面 · 可选）',
     hostScreenBefore: '配合 Harness Plus 信息面板时，允许 ',
     hostScreenAfter: ' 实时显示操控画面；未安装该面板可跳过，不影响电脑操控。',
+    cursorTitle: '实时画面光标与点击涟漪',
+    cursorDesc: '在对话信息面板的实时画面上叠画后台虚拟光标位置与点击涟漪动画。',
     requestBtn: '申请权限',
     grantedBtn: '已允许',
     unknownBtn: '打开系统设置',
     waitDriverBtn: '需先安装驱动',
     appsTitle: '管理可访问的应用',
     appsHint: '智能体首次启动或操控某个应用前会向你询问授权；撤销后立即中止对该应用的操控。',
-    noApps: '暂无「始终允许」或「不允许访问」的应用。',
+    loadingApps: '正在读取应用授权列表…',
+    noApps: '暂无「始终允许」或「不允许访问」的应用',
     allowedGroup: '始终允许的应用',
     blockedGroup: '不允许访问的应用',
+    allowedBadge: '始终允许',
+    blockedBadge: '已拒绝',
     revokeBtn: '撤销',
+    revokeModalTitle: '撤销应用访问权限？',
+    revokeModalDesc: (name: string) => `撤销后将立即中止正在对「${name}」执行的后台操控，下次访问时需重新向你询问授权。`,
+    cancelBtn: '取消',
+    closeBtn: '关闭',
     retryApprovalBtn: '允许再次询问',
     refreshBtn: '重新检测',
     noticeRevoked: '已撤销该应用的访问权限',
@@ -98,16 +120,25 @@ const COPY = {
     hostScreenTitle: 'Screen Recording (Panel Preview · Optional)',
     hostScreenBefore: 'When paired with the Harness Plus info panel, allow ',
     hostScreenAfter: ' to stream live previews. Safe to skip if not installed.',
+    cursorTitle: 'Live cursor & click ripples',
+    cursorDesc: 'Overlay the virtual cursor position and click ripples on live panel previews.',
     requestBtn: 'Request permission',
     grantedBtn: 'Allowed',
     unknownBtn: 'System Settings',
     waitDriverBtn: 'Install driver first',
     appsTitle: 'Application Access',
     appsHint: 'Computer Plus asks before launching or controlling each application. Revoking access immediately stops active operations on that app.',
-    noApps: 'No always-allowed or blocked applications yet.',
+    loadingApps: 'Loading application permissions…',
+    noApps: 'No always-allowed or blocked applications yet',
     allowedGroup: 'Always-allowed applications',
     blockedGroup: 'Blocked applications',
+    allowedBadge: 'Allowed',
+    blockedBadge: 'Blocked',
     revokeBtn: 'Revoke',
+    revokeModalTitle: 'Revoke application access?',
+    revokeModalDesc: (name: string) => `Active background operations on "${name}" will stop immediately, and Computer Plus will ask again next time.`,
+    cancelBtn: 'Cancel',
+    closeBtn: 'Close',
     retryApprovalBtn: 'Allow asking again',
     refreshBtn: 'Check again',
     noticeRevoked: 'Application access revoked',
@@ -141,10 +172,15 @@ async function postJson<T>(path: string, body: Record<string, unknown>): Promise
   return data
 }
 
+function permStateDot(granted: boolean | null | undefined, ready = true): 'ok' | 'warn' | 'idle' {
+  if (!ready || granted === null || granted === undefined) return 'idle'
+  return granted ? 'ok' : 'warn'
+}
+
 function AppBadge({ name, icon, version }: { name: string, icon?: string, version?: string }) {
   return (
     <span className="cp-cfg-badge">
-      {icon && <img src={icon} alt="" width={18} height={18} draggable={false} />}
+      {icon && <img src={icon} alt="" width={16} height={16} draggable={false} />}
       <span>{name}</span>
       {version && <span className="cp-cfg-ver">v{version}</span>}
     </span>
@@ -163,12 +199,14 @@ function GearIcon() {
 export function SettingsPanel({ view = 'page', lang: propLang }: { view?: 'summary' | 'page', lang?: 'zh' | 'en' }) {
   const lang = detectLang(propLang)
   const t = COPY[lang]
+  const cursorOverlay = useCursorOverlay()
   const [setup, setSetup] = useState<SetupState | null>(null)
   const [perms, setPerms] = useState<PermissionsState | null>(null)
   const [busyKey, setBusyKey] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
   const [copied, setCopied] = useState(false)
+  const [revokeTarget, setRevokeTarget] = useState<AppGrantItem | null>(null)
   const mounted = useRef(true)
 
   const refresh = useCallback(async () => {
@@ -227,9 +265,7 @@ export function SettingsPanel({ view = 'page', lang: propLang }: { view?: 'summa
   if (setup !== null && !setup.supported) {
     return (
       <div className="cp-cfg" data-computer-plus-settings="">
-        <div className="cp-cfg-card">
-          <p className="cp-cfg-empty">{t.unsupported}</p>
-        </div>
+        <Banner tone="warn">{t.unsupported}</Banner>
       </div>
     )
   }
@@ -248,36 +284,54 @@ export function SettingsPanel({ view = 'page', lang: propLang }: { view?: 'summa
   ) => {
     if (setup === null) return <span className="cp-cfg-skeleton" aria-hidden="true" />
     if (needDriver && !driverInstalled) {
-      return <button type="button" className="cp-btn cp-cfg-action" disabled>{t.waitDriverBtn}</button>
+      return (
+        <Button size="sm" variant="toolbar" className="cp-cfg-action" disabled>
+          {t.waitDriverBtn}
+        </Button>
+      )
     }
     if (granted === false) {
       return (
-        <button
-          type="button"
-          className="cp-btn cp-btn-primary cp-cfg-action"
+        <Button
+          size="sm"
+          variant="primary"
+          className="cp-cfg-action"
+          loading={busyKey === key}
           disabled={busyKey !== null}
           onClick={() => void runAction(key, async () => {
             setSetup(await postJson<SetupState>('/setup', { action: 'request-permission', target }))
           }, t.noticeRequested)}
         >
           {t.requestBtn}
-        </button>
+        </Button>
       )
     }
     return (
-      <button
-        type="button"
-        className="cp-btn cp-cfg-action"
+      <Button
+        size="sm"
+        variant="toolbar"
+        className="cp-cfg-action"
         data-granted={granted === true ? '' : undefined}
+        loading={busyKey === key}
         disabled={busyKey !== null}
+        icon={granted === true ? <CheckIcon size={13} inline={false} /> : undefined}
+        trailingIcon={<GearIcon />}
         onClick={() => void runAction(key, async () => {
           setSetup(await postJson<SetupState>('/setup', { action: 'open-settings', pane }))
         })}
       >
-        <span>{granted === true ? `✓ ${t.grantedBtn}` : t.unknownBtn}</span>
-        <GearIcon />
-      </button>
+        {granted === true ? t.grantedBtn : t.unknownBtn}
+      </Button>
     )
+  }
+
+  const confirmRevoke = () => {
+    if (revokeTarget === null) return
+    const targetApp = revokeTarget
+    void runAction(`revoke:${targetApp.id}`, async () => {
+      setPerms(await postJson<PermissionsState>('/permissions', { action: 'revoke', id: targetApp.id }))
+      if (mounted.current) setRevokeTarget(null)
+    }, t.noticeRevoked)
   }
 
   return (
@@ -285,161 +339,253 @@ export function SettingsPanel({ view = 'page', lang: propLang }: { view?: 'summa
       <section className="cp-cfg-section" aria-label={t.envTitle}>
         <div className="cp-cfg-head">
           <h3>{t.envTitle}</h3>
-          <button type="button" className="cp-btn cp-btn-sm" disabled={busyKey !== null} onClick={() => void refresh()}>
+          <Button
+            size="sm"
+            variant="toolbar"
+            disabled={busyKey !== null}
+            onClick={() => void refresh()}
+          >
             {t.refreshBtn}
-          </button>
+          </Button>
         </div>
-        <div className="cp-cfg-card">
-          <div className="cp-cfg-row">
-            <div className="cp-cfg-copy">
-              <div className="cp-cfg-row-title">
-                <strong>{t.driverTitle}</strong>
+        <Card>
+          <CardRow
+            title={(
+              <span className="cp-cfg-row-title">
+                <StateDot state={setup === null ? 'idle' : driverInstalled ? 'ok' : 'warn'} />
+                <span>{t.driverTitle}</span>
                 {driverInstalled && <AppBadge name={driverName} icon={setup?.driver.icon} version={setup?.driver.version} />}
-              </div>
-              <p>{driverInstalled ? t.driverReadyDesc : t.driverMissingDesc}</p>
-              {setup !== null && !driverInstalled && (
-                <div className="cp-cfg-cmd">
-                  <code>{INSTALL_SNIPPET}</code>
-                  <button type="button" className="cp-btn cp-btn-sm" onClick={copyCommand}>
-                    {copied ? t.copiedCmd : t.copyCmd}
-                  </button>
-                </div>
-              )}
-              {setup?.driver.error && <p className="cp-cfg-err">{setup.driver.error}</p>}
-            </div>
-            {setup === null ? (
-              <span className="cp-cfg-skeleton" aria-hidden="true" />
-            ) : driverInstalled ? (
-              <span className="cp-cfg-pill" data-ok="">✓ {t.installedBadge}</span>
-            ) : (
-              <button
-                type="button"
-                className="cp-btn cp-btn-primary cp-cfg-action"
-                disabled={installing || busyKey !== null}
-                onClick={() => void runAction('install', async () => {
-                  setSetup(await postJson<SetupState>('/setup', { action: 'install-driver' }))
-                }, t.noticeInstalled)}
-              >
-                {installing ? t.installingBtn : t.installBtn}
-              </button>
+              </span>
             )}
-          </div>
+            description={driverInstalled ? t.driverReadyDesc : t.driverMissingDesc}
+            action={
+              setup === null ? (
+                <span className="cp-cfg-skeleton" aria-hidden="true" />
+              ) : driverInstalled ? (
+                <Badge variant="ok">
+                  <CheckIcon size={12} inline={false} />
+                  <span>{t.installedBadge}</span>
+                </Badge>
+              ) : (
+                <Button
+                  size="sm"
+                  variant="primary"
+                  className="cp-cfg-action"
+                  loading={installing}
+                  disabled={busyKey !== null}
+                  onClick={() => void runAction('install', async () => {
+                    setSetup(await postJson<SetupState>('/setup', { action: 'install-driver' }))
+                  }, t.noticeInstalled)}
+                >
+                  {installing ? t.installingBtn : t.installBtn}
+                </Button>
+              )
+            }
+          >
+            {setup !== null && !driverInstalled && (
+              <div className="cp-cfg-cmd">
+                <code>{INSTALL_SNIPPET}</code>
+                <Button size="sm" variant="toolbar" onClick={copyCommand}>
+                  {copied ? t.copiedCmd : t.copyCmd}
+                </Button>
+              </div>
+            )}
+            {setup?.driver.error && <p className="cp-cfg-err">{setup.driver.error}</p>}
+          </CardRow>
 
-          <div className="cp-cfg-row">
-            <div className="cp-cfg-copy">
-              <strong>{t.a11yTitle}</strong>
-              <p>
+          <CardRow
+            title={(
+              <span className="cp-cfg-row-title">
+                <StateDot state={permStateDot(setup?.driver.accessibility, driverInstalled)} />
+                <span>{t.a11yTitle}</span>
+              </span>
+            )}
+            description={(
+              <>
                 {t.a11yBefore}
                 <AppBadge name={driverName} icon={setup?.driver.icon} />
                 {t.a11yAfter}
-              </p>
-            </div>
-            {renderPermButton('a11y', setup?.driver.accessibility, true, 'driver-accessibility', 'accessibility')}
-          </div>
+              </>
+            )}
+            action={renderPermButton('a11y', setup?.driver.accessibility, true, 'driver-accessibility', 'accessibility')}
+          />
 
-          <div className="cp-cfg-row">
-            <div className="cp-cfg-copy">
-              <strong>{t.driverScreenTitle}</strong>
-              <p>
+          <CardRow
+            title={(
+              <span className="cp-cfg-row-title">
+                <StateDot state={permStateDot(setup?.driver.screenRecording, driverInstalled)} />
+                <span>{t.driverScreenTitle}</span>
+              </span>
+            )}
+            description={(
+              <>
                 {t.driverScreenBefore}
                 <AppBadge name={driverName} icon={setup?.driver.icon} />
                 {t.driverScreenAfter}
-              </p>
-            </div>
-            {renderPermButton('driver-screen', setup?.driver.screenRecording, true, 'driver-screen', 'screenRecording')}
-          </div>
+              </>
+            )}
+            action={renderPermButton('driver-screen', setup?.driver.screenRecording, true, 'driver-screen', 'screenRecording')}
+          />
 
-          <div className="cp-cfg-row">
-            <div className="cp-cfg-copy">
-              <strong>{t.hostScreenTitle}</strong>
-              <p>
+          <CardRow
+            title={(
+              <span className="cp-cfg-row-title">
+                <StateDot state={permStateDot(setup?.host.screenRecording)} />
+                <span>{t.hostScreenTitle}</span>
+              </span>
+            )}
+            description={(
+              <>
                 {t.hostScreenBefore}
                 <AppBadge name={hostName} icon={setup?.host.icon} />
                 {t.hostScreenAfter}
-              </p>
-            </div>
-            {renderPermButton('host-screen', setup?.host.screenRecording, false, 'host-screen', 'screenRecording')}
-          </div>
-        </div>
+              </>
+            )}
+            action={renderPermButton('host-screen', setup?.host.screenRecording, false, 'host-screen', 'screenRecording')}
+          />
+
+          <CardRow
+            title={t.cursorTitle}
+            description={t.cursorDesc}
+            action={(
+              <StandaloneSwitch
+                checked={cursorOverlay}
+                onChange={setCursorOverlay}
+                label={t.cursorTitle}
+              />
+            )}
+          />
+        </Card>
         <p className="cp-cfg-hint">{t.envHint}</p>
       </section>
 
       <section className="cp-cfg-section" aria-label={t.appsTitle}>
         <h3>{t.appsTitle}</h3>
-        <div className="cp-cfg-card">
-          {perms === null ? (
-            <p className="cp-cfg-empty">…</p>
-          ) : perms.allowedApps.length === 0 && perms.blockedApps.length === 0 ? (
-            <p className="cp-cfg-empty">{t.noApps}</p>
-          ) : (
-            <>
-              {perms.allowedApps.length > 0 && (
-                <AppListGroup
-                  title={t.allowedGroup}
-                  apps={perms.allowedApps}
-                  icons={perms.icons}
-                  actionLabel={t.revokeBtn}
-                  busy={busyKey !== null}
-                  onAction={id => void runAction(`revoke:${id}`, async () => {
-                    setPerms(await postJson<PermissionsState>('/permissions', { action: 'revoke', id }))
-                  }, t.noticeRevoked)}
-                />
-              )}
-              {perms.blockedApps.length > 0 && (
-                <AppListGroup
-                  title={t.blockedGroup}
-                  apps={perms.blockedApps}
-                  icons={perms.icons}
-                  actionLabel={t.retryApprovalBtn}
-                  busy={busyKey !== null}
-                  onAction={id => void runAction(`retry:${id}`, async () => {
-                    setPerms(await postJson<PermissionsState>('/permissions', { action: 'retry', id }))
-                  }, t.noticeRetryAllowed)}
-                />
-              )}
-            </>
-          )}
-        </div>
-        <p className="cp-cfg-hint">{t.appsHint}</p>
+        {perms === null ? (
+          <LoadingState title={t.loadingApps} />
+        ) : perms.allowedApps.length === 0 && perms.blockedApps.length === 0 ? (
+          <EmptyState title={t.noApps} description={t.appsHint} />
+        ) : (
+          <div className="cp-cfg-groups">
+            {perms.allowedApps.length > 0 && (
+              <AppListGroup
+                title={t.allowedGroup}
+                badgeText={t.allowedBadge}
+                badgeVariant="ok"
+                apps={perms.allowedApps}
+                icons={perms.icons}
+                actionLabel={t.revokeBtn}
+                actionVariant="danger-ghost"
+                busyKey={busyKey}
+                actionPrefix="revoke"
+                onAction={app => setRevokeTarget(app)}
+              />
+            )}
+            {perms.blockedApps.length > 0 && (
+              <AppListGroup
+                title={t.blockedGroup}
+                badgeText={t.blockedBadge}
+                badgeVariant="subtle"
+                apps={perms.blockedApps}
+                icons={perms.icons}
+                actionLabel={t.retryApprovalBtn}
+                actionVariant="toolbar"
+                busyKey={busyKey}
+                actionPrefix="retry"
+                onAction={app => void runAction(`retry:${app.id}`, async () => {
+                  setPerms(await postJson<PermissionsState>('/permissions', { action: 'retry', id: app.id }))
+                }, t.noticeRetryAllowed)}
+              />
+            )}
+            <p className="cp-cfg-hint">{t.appsHint}</p>
+          </div>
+        )}
       </section>
 
-      {notice && <p className="cp-cfg-notice" role="status">{notice}</p>}
-      {error && <p className="cp-cfg-err" role="alert">{error}</p>}
+      {notice && <Banner tone="info">{notice}</Banner>}
+      {error && <Banner tone="error">{error}</Banner>}
+
+      <Modal
+        open={revokeTarget !== null}
+        onClose={() => { if (busyKey === null) setRevokeTarget(null) }}
+        title={t.revokeModalTitle}
+        description={revokeTarget ? t.revokeModalDesc(revokeTarget.name) : undefined}
+        closeLabel={t.closeBtn}
+        cancelLabel={t.cancelBtn}
+        confirmLabel={t.revokeBtn}
+        confirmTone="danger"
+        confirmLoading={busyKey?.startsWith('revoke:') === true}
+        confirmDisabled={busyKey !== null}
+        onConfirm={confirmRevoke}
+      />
     </div>
   )
 }
 
-function AppListGroup({ title, apps, icons, actionLabel, busy, onAction }: {
+function AppListGroup({
+  title,
+  badgeText,
+  badgeVariant,
+  apps,
+  icons,
+  actionLabel,
+  actionVariant,
+  busyKey,
+  actionPrefix,
+  onAction,
+}: {
   title: string
+  badgeText: string
+  badgeVariant: 'ok' | 'subtle'
   apps: AppGrantItem[]
   icons: Record<string, string>
   actionLabel: string
-  busy: boolean
-  onAction: (id: string) => void
+  actionVariant: 'danger-ghost' | 'toolbar'
+  busyKey: string | null
+  actionPrefix: string
+  onAction: (app: AppGrantItem) => void
 }) {
   return (
     <div className="cp-cfg-group">
-      <h4>{title}</h4>
-      <ul className="cp-cfg-apps">
-        {apps.map(app => (
-          <li key={app.id}>
-            <div className="cp-cfg-app" title={app.bundlePath ?? app.bundleId ?? app.executablePath}>
-              {icons[app.id] ? (
-                <img src={icons[app.id]} alt="" width={30} height={30} draggable={false} />
-              ) : (
-                <span className="cp-cfg-app-ph" aria-hidden="true" />
+      <h4 className="cp-cfg-subhead">{title}</h4>
+      <Card>
+        {apps.map(app => {
+          const subtitle = app.bundleId ?? app.bundlePath ?? app.executablePath
+          const rowBusy = busyKey === `${actionPrefix}:${app.id}`
+          return (
+            <CardRow
+              key={app.id}
+              title={(
+                <span className="cp-cfg-app" title={app.bundlePath ?? app.bundleId ?? app.executablePath}>
+                  {icons[app.id] ? (
+                    <img className="cp-cfg-app-icon" src={icons[app.id]} alt="" width={28} height={28} draggable={false} />
+                  ) : (
+                    <span className="cp-cfg-app-ph" aria-hidden="true" />
+                  )}
+                  <span className="cp-cfg-app-meta">
+                    <span className="cp-cfg-app-name-row">
+                      <strong>{app.name}</strong>
+                      <Badge variant={badgeVariant}>{badgeText}</Badge>
+                    </span>
+                    {subtitle && <span className="cp-cfg-app-id">{subtitle}</span>}
+                  </span>
+                </span>
               )}
-              <div className="cp-cfg-app-meta">
-                <strong>{app.name}</strong>
-                {app.bundleId && <span>{app.bundleId}</span>}
-              </div>
-            </div>
-            <button type="button" className="cp-btn cp-btn-sm" disabled={busy} onClick={() => onAction(app.id)}>
-              {actionLabel}
-            </button>
-          </li>
-        ))}
-      </ul>
+              action={(
+                <Button
+                  size="sm"
+                  variant={actionVariant}
+                  loading={rowBusy}
+                  disabled={busyKey !== null}
+                  onClick={() => onAction(app)}
+                >
+                  {actionLabel}
+                </Button>
+              )}
+            />
+          )
+        })}
+      </Card>
     </div>
   )
 }

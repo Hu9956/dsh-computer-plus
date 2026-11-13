@@ -1,4 +1,5 @@
-import { useEffect, useLayoutEffect, useRef, useState, type RefObject } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore, type RefObject } from 'react'
+import type { StateDotState } from '@kewen/dsh-ui'
 
 /**
  * 电脑操控画面的数据（客户端）。目标来自 host 端投影 computerPlusTarget（src/projection.js），
@@ -120,6 +121,73 @@ export function appStatus(target: ComputerTarget | undefined): string {
   return '已完成'
 }
 
+/** 对应 @kewen/dsh-ui StateDot 的五态语义色与旋转环 */
+export function statusDotState(target: ComputerTarget | undefined): StateDotState {
+  if (target === undefined) return 'idle'
+  if (target.active) return 'busy'
+  if (target.ended === 'aborted') return 'warn'
+  if (target.ended === 'error') return 'error'
+  return 'ok'
+}
+
+/** 面板画面是否叠画虚拟光标与点击涟漪（默认开启，可在扩展设置页开关） */
+export const CURSOR_OVERLAY_KEY = 'computer-plus:cursor-overlay'
+const cursorOverlayListeners = new Set<() => void>()
+let memoryCursorOverlay = true
+
+function webStorage(): Storage | undefined {
+  if (typeof window === 'undefined') return undefined
+  try {
+    const s = window.localStorage
+    if (s && typeof s.getItem === 'function') return s
+  } catch {
+    /* 无痕或沙箱禁用存储 */
+  }
+  return undefined
+}
+
+export function getCursorOverlay(): boolean {
+  const s = webStorage()
+  if (!s) return memoryCursorOverlay
+  try {
+    return s.getItem(CURSOR_OVERLAY_KEY) !== '0'
+  } catch {
+    return memoryCursorOverlay
+  }
+}
+
+export function setCursorOverlay(enabled: boolean): void {
+  memoryCursorOverlay = enabled
+  const s = webStorage()
+  if (s) {
+    try {
+      if (enabled) s.removeItem(CURSOR_OVERLAY_KEY)
+      else s.setItem(CURSOR_OVERLAY_KEY, '0')
+    } catch {
+      /* 无痕或禁存储环境仅保留内存状态 */
+    }
+  }
+  for (const listener of cursorOverlayListeners) listener()
+}
+
+export function useCursorOverlay(): boolean {
+  return useSyncExternalStore(
+    (listener) => {
+      cursorOverlayListeners.add(listener)
+      const onStorage = (event: StorageEvent) => {
+        if (event.key === null || event.key === CURSOR_OVERLAY_KEY) listener()
+      }
+      if (typeof window !== 'undefined') window.addEventListener('storage', onStorage)
+      return () => {
+        cursorOverlayListeners.delete(listener)
+        if (typeof window !== 'undefined') window.removeEventListener('storage', onStorage)
+      }
+    },
+    getCursorOverlay,
+    () => true,
+  )
+}
+
 /** 应用图标地址：pid 进 URL，换应用就是新图（host 只给当前目标的图标，pid 对不上回 204、不缓存） */
 export const appIconUrl = (sessionId: string, target: ComputerTarget | undefined) =>
   target === undefined ? undefined : `${BASE}/icon?${query(sessionId)}&pid=${target.pid}`
@@ -128,8 +196,9 @@ export const appIconUrl = (sessionId: string, target: ComputerTarget | undefined
 export const showDoneBadge = (target: ComputerTarget | undefined) => target?.active === false && target.ended === 'completed'
 
 function usePageVisible(): boolean {
-  const [visible, setVisible] = useState(() => !document.hidden)
+  const [visible, setVisible] = useState(() => (typeof document === 'undefined' ? true : !document.hidden))
   useEffect(() => {
+    if (typeof document === 'undefined') return
     const sync = () => setVisible(!document.hidden)
     document.addEventListener('visibilitychange', sync)
     return () => document.removeEventListener('visibilitychange', sync)
