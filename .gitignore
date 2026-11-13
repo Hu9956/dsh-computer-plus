@@ -5,3 +5,4 @@ preview/dist/
 .npm-cache/
 .scratch/
 .venv/
+docs/*.mp4
