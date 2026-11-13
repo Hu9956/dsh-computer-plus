@@ -421,14 +421,14 @@ final class HudBannerController {
 
     switch state {
     case "preparing":
-      primaryLabel.stringValue = isEnglish ? "Switching to “\(appName)”…" : "即将借用前台操作「\(appName)」"
+      primaryLabel.stringValue = isEnglish ? "Switching to “\(appName)”" : "即将切换到「\(appName)」"
       secondaryLabel.stringValue = isEnglish ? "Hands off briefly" : "请暂松键鼠"
       setDot(color: NSColor(calibratedRed: 0.96, green: 0.62, blue: 0.04, alpha: 1.0), pulse: true)
       layoutAndPlace()
 
     case "active":
-      primaryLabel.stringValue = isEnglish ? "Agent using “\(appName)”" : "Agent 正在使用「\(appName)」"
-      secondaryLabel.stringValue = isEnglish ? "In use — hands off" : "正在使用中，请稍候"
+      primaryLabel.stringValue = isEnglish ? "Agent operating “\(appName)”" : "Agent 正在操作「\(appName)」"
+      secondaryLabel.stringValue = isEnglish ? "Please wait — hands off" : "请稍候，勿动键鼠"
       setDot(color: NSColor(calibratedRed: 0.23, green: 0.51, blue: 0.96, alpha: 1.0), pulse: true)
       layoutAndPlace()
 
@@ -437,7 +437,7 @@ final class HudBannerController {
       restoreFocusIfNeeded()
       let isDone = state == "done"
       if isDone {
-        primaryLabel.stringValue = isEnglish ? "Finished using “\(appName)”" : "「\(appName)」使用完毕"
+        primaryLabel.stringValue = isEnglish ? "Finished on “\(appName)”" : "「\(appName)」操作完成"
         secondaryLabel.stringValue = isEnglish ? "You can continue" : "可以继续使用了"
         setDot(color: NSColor(calibratedRed: 0.13, green: 0.77, blue: 0.37, alpha: 1.0), pulse: false)
       } else {
