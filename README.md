@@ -9,7 +9,6 @@ https://github.com/user-attachments/assets/0981bc36-2133-454c-b00e-f783944115bc
 - **全模式可用 & 节省上下文**：普通对话模式与代码执行模式均可直接调用；精简为 7 个核心动作并默认折叠冗长的系统菜单栏结构，大幅减少多步操作时的 Token 消耗。
 - **一键引导配置 & 面板实时画面（可选）**：同时支持 Apple Silicon 与 Intel Mac，无需安装 Xcode 编译环境，在插件详情页即可一键安装驱动并引导开启系统权限；配合 `Harness Plus` 对话信息面板时还可实时查看 10fps 目标窗口画面与点击落点。
 
-![借用前台时的屏幕顶部状态胶囊](docs/foreground-hud.png)
 
 <img src="docs/live-panel.png" alt="对话信息面板实时操控画面（配合 Harness Plus）" width="340" />
 
