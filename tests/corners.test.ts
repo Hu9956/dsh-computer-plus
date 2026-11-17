@@ -97,6 +97,13 @@ test('设计系统曲率双轨联动：圆角矩形统一配对 --dsh-corner-sha
   ]) {
     assert.match(computerCss, selector)
   }
+
+  // 合成器防抖：零无限 opacity/scale 呼吸动画，且不把 overflow: hidden 放在超椭圆 .cp-screen 上
+  assert.doesNotMatch(computerCss, /\bcp-pulse\b/)
+  assert.doesNotMatch(computerCss, /animation:[^;]*\binfinite\b/)
+  assert.doesNotMatch(computerCss, /will-change:\s*(?:opacity|transform)/)
+  assert.doesNotMatch(computerCss, /\.cp-screen\[data-has-frame\]\s*\{[^}]*overflow:\s*(?:hidden|clip)/s)
+  assert.match(computerCss, /\.cp-screen-clip\s*\{[^}]*corner-shape:\s*round;\s*overflow:\s*clip;/s)
 })
 
 test('客户端源码零字符/emoji 勾选叉号图标，产物 lib/client.js 零外部 @kewen/dsh-ui 依赖', () => {

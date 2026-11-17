@@ -116,8 +116,8 @@ function Frame({ className, url, label, active, done, showCursor, status, corner
           onOpen()
         },
       }
-  return (
-    <div ref={box} className={className} data-has-frame="" data-frozen={active ? undefined : ''} {...open}>
+  const media = (
+    <>
       <img
         ref={img}
         src={url}
@@ -149,6 +149,11 @@ function Frame({ className, url, label, active, done, showCursor, status, corner
           </svg>
         </span>
       )}
+    </>
+  )
+  return (
+    <div ref={box} className={className} data-has-frame="" data-frozen={active ? undefined : ''} {...open}>
+      {onOpen !== undefined ? <div className="cp-screen-clip">{media}</div> : media}
     </div>
   )
 }

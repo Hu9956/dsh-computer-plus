@@ -57,12 +57,20 @@ export const computerCss = `
   text-align: center;
   transition: border-color var(--dsh-dur-hover, 120ms) ease, background-color var(--dsh-dur-hover, 120ms) ease;
 }
-/* 有画面：图片按原比例放进 16:10 的框里（竖窗口两边留底色），不裁不拉伸；框是光标的定位参照 */
+/* 有画面：图片按原比例放进 16:10 的框里（竖窗口两边留底色），不裁不拉伸；框是光标的定位参照。
+   把 overflow: clip 下沉到内层 corner-shape: round 容器（.cp-screen-clip），避免外层 superellipse + overflow: hidden 在 .hs-info-panel 内触发 kClipPath 离屏 RPDQ */
 .cp-screen[data-has-frame] {
   position: relative;
   padding: 0;
-  overflow: hidden;
 }
+.cp-screen-clip {
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  corner-shape: round;
+  overflow: clip;
+}
+.cp-screen-clip > img,
 .cp-screen[data-has-frame] > img {
   display: block;
   width: 100%;
@@ -72,7 +80,7 @@ export const computerCss = `
   -webkit-user-drag: none;
 }
 /* 回合结束后冻结的最后一帧：稍微压暗，和正在操控的画面区分开 */
-.cp-screen[data-frozen] > img {
+.cp-screen[data-frozen] img {
   opacity: .72;
 }
 .cp-screen[data-zoomable] {
@@ -313,11 +321,6 @@ export const computerCss = `
   border-radius: 999px;
   corner-shape: round;
   background: var(--dsh-surface-sunken, var(--dsw-alias-interactive-bg-hover));
-  animation: cp-pulse 1.3s ease-in-out infinite;
-}
-@keyframes cp-pulse {
-  0%, 100% { opacity: .55; }
-  50% { opacity: 1; }
 }
 .cp-cfg-action {
   min-width: 108px;
@@ -478,6 +481,6 @@ export const computerCss = `
 @media (prefers-reduced-motion: reduce) {
   .cp-cursor { transition: none; }
   .cp-ripple { animation-duration: .01s; }
-  .cp-done, .cp-zoom, .cp-cfg-skeleton { animation: none; }
+  .cp-done, .cp-zoom { animation: none; }
 }
 `
